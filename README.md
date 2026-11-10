@@ -28,3 +28,18 @@ Geometry for new references uses ComfyUI core nodes (`LoadMoGeModel`/`MoGeInfere
 - OpenCV: Apache-2.0. SciPy: BSD-3. HTTPX: BSD-3. PyYAML: MIT.
 - Model weights are not included; check the licenses of the MoGe, SAM 3D Body and any image/video
   model you use with the example graph before commercial use.
+
+## bpy runtime libraries
+
+On Linux, run 3DA Blender Runtime (bpy libs) once with download=True. Missing
+shared libraries are fetched from conda-forge and stored only in
+data_root/runtime/bpy_libs. No system packages or administrator access are needed.
+The isolated bpy worker receives this directory via LD_LIBRARY_PATH. The report
+includes the bpy version, missing libraries and the libEGL_nvidia.so.0 probe.
+download=False only probes. NVIDIA drivers and a working render context are still
+provided by the host.
+
+The X11 libraries use MIT/X11 licenses; libuuid is BSD-3-Clause, and GLVND uses
+its permissive vendor license. Actual versions, package SHA256, info/about.json
+licenses and included license texts are retained in MANIFEST.json. Only shared
+libraries are extracted; package scripts are never executed.
