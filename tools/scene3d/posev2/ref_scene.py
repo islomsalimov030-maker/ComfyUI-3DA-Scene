@@ -27,6 +27,20 @@ def sam_input_tensor(model, tensor):
     return tensor
 
 
+def sam_autocast(model):
+    """Cover internal Float/half concatenations during server hand refinement."""
+    from contextlib import nullcontext
+    if os.environ.get('THREEDA_SERVER_MODE') != '1':
+        return nullcontext()
+    import torch
+    parameter = next(model.model.parameters())
+    dtype = getattr(model.model, 'backbone_dtype', parameter.dtype)
+    device = torch.device(getattr(model, 'load_device', parameter.device))
+    if dtype not in (torch.float16, torch.bfloat16) or device.type not in ('cuda', 'cpu'):
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--comfy", required=True)
@@ -120,7 +134,7 @@ def main():
         pts, nrm, msk, fov_y = geo[p]
         H, W = im.shape[:2]
         sam_started = time.monotonic()
-        with torch.inference_mode():
+        with torch.inference_mode(), sam_autocast(sam):
             data = loop.run_until_complete(run(n.SAM3DBody_Predict, sam3d_body_model=sam, image=sam_input_tensor(sam, t),
                                                run_hand_refinement=True, fov=fov_y, batch_size=8))[0]
         sam_s = time.monotonic() - sam_started

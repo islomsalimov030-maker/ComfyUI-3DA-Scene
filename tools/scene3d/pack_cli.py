@@ -89,7 +89,7 @@ def worker_python(config, executable):
     return [executable] if config.get('server_mode') else [executable, '-I']
 
 
-def stderr_tail(value):
+def stderr_tail(value, lines=30):
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
     text = str(value or "")
@@ -98,7 +98,7 @@ def stderr_tail(value):
         if len(secret) >= 4 and re.search(r"TOKEN|PASSWORD|PASS$|SECRET|AUTH|API_KEY", key, re.I):
             text = text.replace(secret, "[redacted]")
     text = re.sub(r"(https?://)[^\s/@]+:[^\s/@]+@", r"\1[redacted]@", text)
-    return "\n".join(text.splitlines()[-30:])
+    return text if lines is None else "\n".join(text.splitlines()[-lines:])
 
 
 class StageError(RuntimeError):
@@ -111,6 +111,14 @@ def run_stage(command, stage, env=None):
     import signal
 
     command = [str(x) for x in command]
+    def log_output(stdout, stderr):
+        directory = (env if env is not None else os.environ).get('THREEDA_STAGE_LOG_DIR')
+        if directory:
+            root = Path(directory)
+            root.mkdir(parents=True, exist_ok=True)
+            name = re.sub(r'[^a-z0-9_-]+', '_', stage.lower())
+            for kind, value in [('stdout', stdout), ('stderr', stderr)]:
+                (root/(name+'.'+kind+'.txt')).write_text(stderr_tail(value, lines=None), encoding='utf-8')
     windows = sys.platform == "win32"
     process_options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows
                        else {"start_new_session": True})
@@ -150,8 +158,10 @@ def run_stage(command, stage, env=None):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+        log_output(locals().get('stdout', ''), locals().get('stderr', diagnostic))
         raise StageError(f"{stage}: timeout after {TIMEOUT}s", diagnostic) from exc
     stdout, stderr = stdout or "", stderr or ""
+    log_output(stdout, stderr)
     if proc.returncode or "Traceback (most recent call last)" in stdout + stderr:
         # Blender often sends Python tracebacks to stdout, not stderr.
         raise StageError(f"{stage}: subprocess failed ({proc.returncode})", stderr or stdout)

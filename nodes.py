@@ -186,6 +186,7 @@ def invoke(command, fields, images):
     t0 = time.monotonic()
     options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
     env = os.environ.copy()
+    env['THREEDA_STAGE_LOG_DIR'] = str(work / 'logs')
     if cfg.get('server_mode'):
         env['THREEDA_SERVER_MODE'] = '1'
     proc = subprocess.Popen([cfg['python'], str(script), command, '--request', str(req), '--output', str(out)],
