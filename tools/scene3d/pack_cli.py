@@ -1,0 +1,704 @@
+"""File-based bridge for 3DA nodes; no ComfyUI server or H3 execution.
+
+  python tools/scene3d/pack_cli.py location|place --request request.json --output result.json
+
+config: farm_root, comfy, python (farm venv), geometry_python (Comfy venv),
+blender, mannequin (.blend), cell_px=16. Optional, explicit preparation data:
+location_hints_by_id[id] = {seeds: {object_type: [world_x, world_y, world_z]},
+                          footprints: {object_type: {bbox: [[x0,y0],[x1,y1]]}
+                                       or {polygon: [[x,y], ...]}}}
+prompt_context_by_location[id] = {room, action, anchor}; anchor is the textual
+scale anchor consumed by the existing step-9 generator, not a placement rule.
+Existing profile.prompt_context is also accepted. No table or secret file is read.
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import threeda_blender  # bpy wheel in a child process, else Blender binary
+import sys
+import time
+import uuid
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[1]
+TIMEOUT = 600
+# Input defaults only; support selection/geometry belongs exclusively to posev2.
+DEFAULT_SUPPORT = {
+    "stand": ["foot.L", "foot.R"], "crouch": ["foot.L", "foot.R"],
+    "kneel": ["knee.L", "knee.R", "shin.L", "shin.R"],
+    "sit_edge": ["pelvis", "thigh.L", "thigh.R"],
+    "sit_tucked": ["pelvis", "thigh.L", "thigh.R"], "sit_floor": ["pelvis"],
+    "recline": ["pelvis"], "lie": ["pelvis", "torso", "thigh.L", "thigh.R"],
+    "all_fours": ["knee.L", "knee.R"],
+}
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def save_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def required_file(value, label):
+    if not value or not Path(value).is_file():
+        raise ValueError(f"{label}: required file is missing")
+    return Path(value).resolve()
+
+
+def config_for(request):
+    supplied = request.get("config", {})
+    if not isinstance(supplied, dict):
+        raise ValueError("config must be an object")
+    config = dict(supplied)
+    defaults = {
+        "farm_root": os.environ.get("FARM_ROOT", ""),
+        "comfy": os.environ.get("THREEDA_COMFY_ROOT", str(REPO.parent.parent)),
+        "python": sys.executable,
+        "geometry_python": sys.executable,
+        "blender": os.environ.get("FARM_BLENDER", ""),
+        "mannequin": os.environ.get("FARM_MANNEQUIN", ""), "cell_px": 16,
+    }
+    for key, value in defaults.items():
+        config.setdefault(key, value)
+    if not config["farm_root"]:
+        raise ValueError("config.farm_root or FARM_ROOT is required")
+    if isinstance(config["cell_px"], bool) or config["cell_px"] != 16:
+        raise ValueError("09c requires config.cell_px=16")
+    config["farm_root"] = str(Path(config["farm_root"]).resolve())
+    return config
+
+
+def stderr_tail(value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value or "")
+    # Subprocess diagnostics can contain credentials in third-party exceptions.
+    for key, secret in os.environ.items():
+        if len(secret) >= 4 and re.search(r"TOKEN|PASSWORD|PASS$|SECRET|AUTH|API_KEY", key, re.I):
+            text = text.replace(secret, "[redacted]")
+    text = re.sub(r"(https?://)[^\s/@]+:[^\s/@]+@", r"\1[redacted]@", text)
+    return "\n".join(text.splitlines()[-30:])
+
+
+class StageError(RuntimeError):
+    def __init__(self, stage, diagnostic):
+        super().__init__(stage)
+        self.diagnostic = stderr_tail(diagnostic)
+
+
+def run_stage(command, stage, env=None):
+    import signal
+
+    command = [str(x) for x in command]
+    windows = sys.platform == "win32"
+    process_options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows
+                       else {"start_new_session": True})
+    try:
+        proc = subprocess.Popen(command, cwd=str(REPO), env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                                **process_options)
+    except OSError as exc:
+        raise StageError(f"{stage}: could not start subprocess", str(exc)) from exc
+    try:
+        stdout, stderr = proc.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        diagnostic = exc.stderr or exc.stdout or ""
+        try:
+            if windows:
+                # Kill the worker AND its geometry/Blender descendants, not just
+                # the direct child as subprocess.run(timeout=...) would do.
+                terminated = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+                if terminated.returncode:
+                    proc.kill()
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, subprocess.TimeoutExpired):
+            # Still reap the direct child if the tree already exited or taskkill
+            # itself failed; pipe collection below is bounded independently.
+            proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+            diagnostic = stderr or stdout or diagnostic
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        raise StageError(f"{stage}: timeout after {TIMEOUT}s", diagnostic) from exc
+    stdout, stderr = stdout or "", stderr or ""
+    if proc.returncode or "Traceback (most recent call last)" in stdout + stderr:
+        # Blender often sends Python tracebacks to stdout, not stderr.
+        raise StageError(f"{stage}: subprocess failed ({proc.returncode})", stderr or stdout)
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
+def modules(config):
+    # Set paths before importing farm_env (imported indirectly by step-9 helpers).
+    os.environ["FARM_ROOT"] = config["farm_root"]
+    os.environ["FARM_COMFY"] = config["comfy"]
+    for directory in (REPO, HERE, HERE / "plate", HERE / "posev2"):
+        sys.path.insert(0, str(directory))
+    import pose_fit
+    import profiles
+    return pose_fit, profiles
+
+
+def location_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+        raise ValueError("location_id must be a safe single directory name")
+    return value
+
+
+def vector(value, size, label):
+    if not isinstance(value, (list, tuple)) or len(value) != size:
+        raise ValueError(f"{label}: expected {size} finite numbers")
+    if any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in value):
+        raise ValueError(f"{label}: expected {size} finite numbers")
+    return list(value)
+
+
+def plate_assets(directory):
+    directory = Path(directory)
+    for name in ("plate.json", "plate_mesh.obj", "plate_rgb.png", "depth_loc.png"):
+        required_file(directory / name, name)
+    return directory
+
+
+def hints_for(config, loc_id):
+    return config.get("location_hints_by_id", {}).get(loc_id, {})
+
+
+def assets_for(config, loc_id, profile_directory):
+    return plate_assets(config.get("location_asset_dirs", {}).get(loc_id, profile_directory))
+
+
+def require_profile_geometry(profile):
+    """Ask existing profile/D4 code to validate its assets; never manufacture a footprint."""
+    for obj in profile.data["objects"]:
+        if "top_grid_npz" in obj:
+            # Missing D4 footprint is an existing diagnostic, not permission to
+            # invent a mask or abort other placement checks. Missing assets raise.
+            profile.region(obj)
+        if "pts_npz" in obj:
+            required_file(profile.dir / obj["pts_npz"], f"{obj['id']} wall points")
+
+
+def do_location(request, config):
+    loc_id = location_id(request.get("location_id"))
+    directory = Path(config["farm_root"]) / "locations" / loc_id
+    profile_path = directory / "profile.json"
+    if profile_path.is_file():
+        geometry_dir = assets_for(config, loc_id, directory)
+        data = read_json(profile_path)
+        if data.get("loc_id") != loc_id:
+            raise ValueError("cached profile loc_id mismatch")
+    else:
+        photo = required_file(request.get("plate"), "plate")
+        directory.mkdir(parents=True, exist_ok=True)
+        if not all((directory / n).is_file() for n in ("plate.json", "plate_mesh.obj", "plate_rgb.png", "depth_loc.png")):
+            core = ["--comfy", config["comfy"]] if config.get('server_mode') else []
+            run_stage([config["geometry_python"], HERE / "plate/plate_geometry.py", photo, directory,
+                       "--size", "1344x768", *core], "plate MoGe")
+        geometry_dir = plate_assets(directory)
+        hints = hints_for(config, loc_id)
+        if "seeds" not in hints:
+            pf, profiles = modules(config)
+            import auto_surfaces
+            import tempfile
+            plate = pf.Plate(directory)
+            with tempfile.TemporaryDirectory(prefix="3da_auto_") as td:
+                generated = auto_surfaces.write_auto_profile(loc_id, plate, Path(td))
+                for asset in Path(td).iterdir():
+                    if (directory / asset.name).exists():
+                        raise ValueError("auto profile refuses overwrite: " + asset.name)
+                    __import__("shutil").copy2(asset, directory / asset.name)
+            data = read_json(profile_path)
+            preview = directory / "objects_preview.png"
+            auto_surfaces.render_objects_preview(plate, profile_path, preview)
+            return {"status": "ok", "location": str(profile_path.resolve()),
+                    "plate": str((geometry_dir / "plate_rgb.png").resolve()),
+                    "objects": data["objects"], "objects_preview": str(preview.resolve())}
+        seeds = {name: vector(point, 3, f"seed {name}") for name, point in hints["seeds"].items()}
+        pf, profiles = modules(config)
+        plate = pf.Plate(directory)
+        import numpy as np
+        plate.object_masks = {}
+        for asset in sorted((directory / "object_masks").glob("*.npz")):
+            with np.load(asset, allow_pickle=False) as data:
+                plate.object_masks[asset.stem] = {"mask": data["mask"].astype(bool), "origin": data["origin"]}
+        profiles.write_draft(loc_id, plate, seeds, 1.62, root=config["farm_root"])
+        data = read_json(profile_path)
+        for obj in data["objects"]:
+            hint = hints.get("footprints", {}).get(obj["id"], hints.get("footprints", {}).get(obj["type"], {}))
+            if "bbox" in hint:
+                bbox = hint["bbox"]
+                if len(bbox) != 2:
+                    raise ValueError("footprint bbox requires two XY points")
+                obj["footprint_bbox"] = [vector(p, 2, "footprint bbox") for p in bbox]
+            if "polygon" in hint:
+                if len(hint["polygon"]) < 3:
+                    raise ValueError("footprint polygon requires at least three XY points")
+                obj["footprint_polygon"] = [vector(p, 2, "footprint polygon") for p in hint["polygon"]]
+        save_json(profile_path, data)
+    if any("top_grid_npz" in obj for obj in data["objects"]):
+        _, profiles = modules(config)
+        require_profile_geometry(profiles.LocationProfile(profile_path))
+    pf, _ = modules(config)
+    import auto_surfaces
+    # Preview lives outside the immutable prepared location profile.
+    preview_dir = Path(config.get("cache_dir", str(Path(config["farm_root"]) / "cache"))) / "objects_preview" / loc_id
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview = preview_dir / "objects_preview.png"
+    auto_surfaces.render_objects_preview(pf.Plate(geometry_dir), profile_path, preview)
+    return {"status": "ok", "location": str(profile_path.resolve()),
+            "plate": str((geometry_dir / "plate_rgb.png").resolve()), "objects_preview": str(preview.resolve()),
+            "objects": [{"id": o["id"], "type": o.get("type", o.get("name")),
+                         "height_m": o.get("h0", o.get("z_m", [None, None])[-1])} for o in data["objects"]]}
+
+
+def parts(value):
+    if not value:
+        return []
+    if isinstance(value, list) and all(isinstance(x, str) for x in value):
+        return value
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()]
+    raise ValueError("support_parts must be a list or comma-separated string")
+
+
+def contacts(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = [dict(zip(("part", "surface"), item.strip().split(":"))) for item in value.split(",")]
+    if not isinstance(value, list) or any(not isinstance(c, dict) or not isinstance(c.get("part"), str)
+                                         or not isinstance(c.get("surface"), str) for c in value):
+        raise ValueError("secondary_contacts requires [{part,surface}] or part:surface,...")
+    return value
+
+
+def seed_for(profile, spec, config):
+    """Read an explicit world anchor or the existing profile's stored zone, never infer furniture."""
+    import numpy as np
+    hints = hints_for(config, profile.data["loc_id"])
+    seed = hints.get("seeds", {}).get(spec.instance_hint) or hints.get("seeds", {}).get(spec.target_object)
+    obj, _ = profile.find_object(spec.target_object, instance_hint=spec.instance_hint,
+                                 anchor_xy=seed[:2] if seed else None, pose_class=spec.pose_class)
+    if obj is None:
+        raise ValueError("target instance is absent or ambiguous; prepare profile/config spatial hints")
+    if obj.get("seed_world") is not None and seed is None:
+        return np.asarray(vector(obj["seed_world"], 3, "auto-surface seed_world"), float)
+    if seed is not None:
+        return np.asarray(vector(seed, 3, "location seed"), float)
+    anchor = profile.anchor(obj["id"], spec.pose_class)
+    if anchor is None:
+        raise ValueError("profile has no anchor for this pose class; prepare explicit location seed")
+    if "seed_world" in anchor:
+        return np.asarray(vector(anchor["seed_world"], 3, "profile seed_world"), float)
+    zone = profile.zone_metrics(anchor)
+    xy, h = np.asarray(zone["xy"]), np.asarray(zone["h"])
+    if xy.ndim != 2 or xy.shape[1] != 2 or len(xy) == 0 or not np.isfinite(xy).all() or not np.isfinite(h).all() or h.size == 0:
+        raise ValueError("profile anchor zone is missing finite spatial hints")
+    return np.r_[xy.mean(axis=0), h.mean()]
+
+
+def prompt_for(profile, config, fit):
+    """Keep step-9/httpx imports in the farm venv, never the geometry venv."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="3da-prompt-") as temp:
+        request_path, output_path = Path(temp) / "request.json", Path(temp) / "result.json"
+        save_json(request_path, {"config": config, "profile_data": profile.data, "fit": fit})
+        run_stage([config["python"], "-I", Path(__file__).resolve(), "place", "--request", request_path,
+                   "--output", output_path, "--prompt-worker"], "step9 prompt")
+        result = read_json(required_file(output_path, "step9 prompt result"))
+        if result.get("status") == "error":
+            raise StageError(result.get("error", "step9 prompt failed"), result.get("stderr_tail", ""))
+        return result["h3_prompt"]
+
+
+def prompt_direct(profile, config, fit):
+    import prompt_h3
+    context = dict(profile.data.get("prompt_context", {}))
+    context.update(config.get("prompt_context_by_location", {}).get(profile.data["loc_id"], {}))
+    if not context.get("anchor"):
+        raise ValueError("prompt scale anchor missing: prepare profile.prompt_context.anchor or "
+                         "config.prompt_context_by_location[id].anchor")
+    scene = {"action": context.get("action", "holding the body pose shown in <Video 1>"), "anchor": context["anchor"]}
+    text = prompt_h3.prompt_d(prompt_h3.table_prompt({"room": context.get("room", "the room in <Picture 1>")}, scene), fit)
+    additions = []
+    pose_text = str(fit.get("pose_text", "")).strip()
+    if pose_text:
+        if "\n" in pose_text or any(tag in pose_text for tag in ("subject_definitions:", "summary:", "overall_soundscape:")):
+            raise ValueError("pose_text must be one pose sentence, not prompt sections")
+        additions.append(pose_text.rstrip(".!?") + ".")
+    for prop in fit.get("props_prompt", []):
+        name = str(prop.get("description_en") or prop["name"]).strip()
+        if any(c in name for c in "\r\n"):
+            raise ValueError("prop description must be one line")
+        additions.append(f"The {name} floats motionless in the air; preserve its exact shape, color and material as in the init image.")
+    if additions:
+        marker = "\noverall_soundscape:"
+        text = text.replace(marker, "\n" + " ".join(additions) + marker, 1)
+    prompt_h3.require_lint(text, video=True)
+    return text
+
+
+def prepare_images(directory, plate_path, proxy_mode, body_json, strength, cell_px):
+    import numpy as np
+    from PIL import Image
+    import pose_proxy_v26 as proxy
+    size = (1344, 768)  # Gate09c cell=16 is defined in this raster, not geometry resolution.
+    with Image.open(plate_path) as image:
+        plate = np.asarray(image.convert("RGB").resize(size, Image.Resampling.LANCZOS))
+    with Image.open(directory / "playblast.png") as image:
+        rendered = image.convert("RGB").resize(size, Image.Resampling.LANCZOS)
+        playblast = np.asarray(rendered)
+    rendered.save(directory / "playblast.png")
+    with Image.open(directory / "silhouette.png") as image:
+        sil = np.asarray(image.convert("L").resize(size, Image.Resampling.NEAREST)) >= 128
+    Image.fromarray(sil.astype(np.uint8) * 255).save(directory / "silhouette.png")
+    Image.fromarray(plate).save(directory / "plate.png")
+    if not sil.any():
+        raise ValueError("renderer produced empty silhouette")
+    figure = playblast
+    if proxy_mode == "color":
+        colors = proxy.outfit_colors(required_file(body_json, "body_json for color proxy"))
+        with Image.open(directory / "labels.png") as image:
+            labels = proxy.decode_labels(np.asarray(image.convert("RGB").resize(size, Image.Resampling.NEAREST)), sil)
+        figure = proxy.proxy_image(playblast, plate, sil, labels, colors)
+        Image.fromarray(figure).save(directory / "proxy.png")
+    # Exact plate outside the figure, matching ImageCompositeMasked in step 9.
+    Image.fromarray(np.where(sil[..., None], figure, plate)).save(directory / "init.png")
+    sm = proxy.strength_map(sil, strength, cell_px) if strength else np.zeros(sil.shape)
+    Image.fromarray(np.rint(sm * 255).astype(np.uint8)).save(directory / "strength.png")
+    overlay = plate.astype(float) * (1 - .45 * sm[..., None])
+    overlay += np.array([255, 70, 30]) * (.45 * sm[..., None])
+    from scipy.ndimage import binary_erosion
+    overlay[sil & ~binary_erosion(sil)] = [0, 255, 180]
+    Image.fromarray(np.rint(overlay).astype(np.uint8)).save(directory / "debug.png")
+
+
+def compose_props(directory, overlay_dir):
+    import numpy as np
+    from PIL import Image
+    import prop_render
+    size = (1344, 768)
+    desc = read_json(overlay_dir / "props_render.json")
+    # Props retain their source appearance in both guides. A grey prop video
+    # otherwise contradicts material refs at every guided frame. Body proxy
+    # remains unchanged; clay is still saved as a diagnostic render.
+    for target, source in (("init.png", "textured_rgba"), ("playblast.png", "textured_rgba")):
+        base = Image.open(directory / target).convert("RGBA")
+        overlay = Image.open(desc[source]).convert("RGBA").resize(size, Image.Resampling.LANCZOS)
+        Image.alpha_composite(base, overlay).convert("RGB").save(directory / target)
+    body = np.asarray(Image.open(directory / "strength.png").convert("L"), dtype=float) / 255
+    props = [(Image.open(p["silhouette"]).convert("L").resize(size, Image.Resampling.NEAREST),
+              p["prop_strength"]) for p in desc["props"]]
+    strength = prop_render.combine_strength(body, props)
+    Image.fromarray(np.rint(strength * 255).astype("uint8")).save(directory / "strength.png")
+    from prop_composite import repair_mask
+    # Work from the actual quantized masks passed to Remote.
+    quantized = np.rint(strength*255).astype('uint8')
+    body_sil=np.asarray(Image.open(directory/'silhouette.png').convert('L'))>127
+    prop_sil=np.logical_or.reduce([np.asarray(mask)>127 for mask,_ in props])
+    repair = repair_mask(body,quantized,body_sil,prop_sil)
+    source = Image.open(directory/'plate.png').convert('RGBA')
+    layer = Image.open(desc['textured_rgba']).convert('RGBA').resize(size,Image.Resampling.LANCZOS)
+    Image.alpha_composite(source,layer).convert('RGB').save(directory/'prop_repair.png')
+    Image.fromarray(repair.astype('uint8')*255).save(directory/'prop_repair_mask.png')
+    plate = np.asarray(Image.open(directory / "plate.png"), dtype=float)
+    debug = plate * (1 - .45 * strength[..., None]) + np.array([255,70,30]) * (.45 * strength[..., None])
+    Image.fromarray(np.rint(debug).astype("uint8")).save(directory / "debug.png")
+
+
+def do_place(request, config):
+    t0 = time.monotonic()
+    timings = {}
+    profile_path = required_file(request.get("location"), "location profile.json")
+    profile_data = read_json(profile_path)
+    plate_dir = assets_for(config, location_id(profile_data.get("loc_id")), profile_path.parent)
+    pose = required_file(request.get("pose_ref"), "pose_ref")
+    pc = request.get("pose_class")
+    if pc not in DEFAULT_SUPPORT:
+        raise ValueError("pose_class must be one of " + ", ".join(DEFAULT_SUPPORT))
+    if not isinstance(request.get("target_object"), str) or not request["target_object"].strip():
+        raise ValueError("target_object is required")
+    height = float(request.get("height_m", 1.62))
+    strength = float(request.get("strength", 1.0))
+    if not math.isfinite(height) or height <= 0 or not math.isfinite(strength) or not 0 <= strength <= 1:
+        raise ValueError("invalid height_m or strength")
+    mode = request.get("proxy", "grey")
+    if mode not in ("grey", "color"):
+        raise ValueError("proxy must be grey or color")
+    seed_value = request.get("seed", 101)
+    if isinstance(seed_value, bool) or not isinstance(seed_value, int) or seed_value < 0:
+        raise ValueError("seed must be a nonnegative integer")
+    mannequin = required_file(config["mannequin"], "config.mannequin / FARM_MANNEQUIN")
+    body_path = request.get("body_json")
+    body = read_json(required_file(body_path, "body_json")) if body_path else None
+    if body is not None:
+        if not isinstance(body.get("body_dims"), dict):
+            raise ValueError("body_json requires body_dims")
+        for key in ("H", "L_thigh", "L_torso"):
+            value = body["body_dims"].get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"body_json.body_dims.{key} must be finite and positive")
+    if mode == "color" and not body:
+        raise ValueError("color proxy requires body_json with outfit_colors")
+    pf, profiles = modules(config)
+    import numpy as np
+    import place
+    import refine
+    from shot_spec import ShotSpec
+    profile = profiles.LocationProfile(profile_path)
+    require_profile_geometry(profile)
+    spec = ShotSpec(id="pose", pose_class=pc, target_object=request["target_object"].strip(),
+                    support_parts=parts(request.get("support_parts")) or DEFAULT_SUPPORT[pc],
+                    instance_hint=request.get("instance_hint") or None,
+                    secondary_contacts=contacts(request.get("secondary_contacts")))
+    explicit = next((o for o in profile.data["objects"] if o["id"] == spec.target_object), None)
+    if explicit is not None:
+        if spec.instance_hint and spec.instance_hint != explicit["id"]:
+            raise ValueError("target ID conflicts with instance_hint")
+        spec.instance_hint = explicit["id"]
+        spec.target_object = explicit.get("type", explicit.get("name", "other"))
+    if profile.data.get("auto_surfaces", {}).get("floor_status") not in (None, "ok"):
+        raise ValueError("auto profile floor is ambiguous; explicit floor preparation required before placement")
+    seed = seed_for(profile, spec, config)
+    # Validate required prompt metadata before spending GPU time.
+    prompt_for(profile, config, {"shot_spec": spec.to_dict()})
+    cache = Path(config.get("cache_dir", str(Path(config["farm_root"]) / "cache"))) / "pose_ref" / hashlib.sha256(pose.read_bytes()).hexdigest()
+    cache.mkdir(parents=True, exist_ok=True)
+    rf = cache / "pose.ref.npz"
+    stage = time.monotonic()
+    if not rf.is_file():
+        canonical = cache / "pose.png"
+        from PIL import Image
+        with Image.open(pose) as image:
+            if image.format != "PNG":
+                raise ValueError("pose_ref must be a PNG")
+            image.convert("RGB").save(canonical)
+        run_stage([config["geometry_python"], HERE / "posev2/ref_scene.py", "--comfy", config["comfy"],
+                   "--out", cache, canonical], "pose MoGe + SAM 3D Body")
+    required_file(rf, "SAM body mesh (no person / incomplete reference cache)")
+    ref = pf.load_ref(rf)
+    if ref["F"].ndim != 2 or ref["F"].shape[1] != 3 or not len(ref["F"]) or not np.isfinite(ref["V"]).all():
+        raise ValueError("SAM reference body mesh missing/invalid")
+    ref.update(path=str(rf), body_cache_dir=str(cache / "body_geometry"), image_path=str(pose), vertical_python=config['python'])
+    timings["reference_s"] = round(time.monotonic() - stage, 3)
+    job = Path(config["farm_root"]) / "pack" / "jobs" / uuid.uuid4().hex
+    job.mkdir(parents=True)
+    plate = pf.Plate(plate_dir)
+    stage = time.monotonic()
+    import manual_pose
+    key = manual_pose.placement_key(rf, profile, config, spec, height, seed, {"body": body, "random_seed": seed_value})
+    cache_dir = Path(config.get("cache_dir", str(Path(config["farm_root"]) / "cache"))) / "placement" / key
+    base = manual_pose.load_placement(cache_dir, key)
+    cache_hit = base is not None
+    if base is None:
+        np.random.seed(seed_value % (2 ** 32))
+        refine_ctx = refine.load_ctx(config["comfy"])
+        result = place.place(ref, plate, spec, seed, height, profile=profile,
+                             body_src="profile" if body else "proxy", dims_override=body["body_dims"] if body else None,
+                             refine_ctx=refine_ctx, trace_dir=job/'trace')
+        manual_pose.save_placement(cache_dir, result, ref, plate, spec, key)
+        base = manual_pose.load_placement(cache_dir, key)
+        if base is None:
+            raise ValueError(f"placement has no body geometry (status={result['status']})")
+    values = {k: request.get(k, 0.) for k in ("body_dx", "body_dy", "body_dz", "body_dyaw", "body_dpitch", "body_droll")}
+    if request.get('body_transform'):
+        from scene_edit import body_delta
+        values['body_matrix'] = body_delta(request['body_transform'], key)
+    if 'body_matrix' in values or any(float(v) != 0 for v in values.values()):
+        X, KP, fit = manual_pose.revalidate(base, ref, plate, profile, spec, seed, height, values)
+    else:
+        X, KP, fit = base["X"], base["KP"], base["report"]
+    # Advisory frame coverage of the projected 3D bbox, not fraction of vertices.
+    import itertools
+    import prop_render
+    corners = np.array(list(itertools.product(*zip(X.min(axis=0), X.max(axis=0)))))
+    u, v, z = plate.project(corners)
+    fraction = prop_render.projected_bbox_fraction(np.column_stack((u / plate.Wp, v / plate.Hp, z)))
+    placement_frame=dict(fit.get('frame',{}))
+    fit['frame'] = {**placement_frame,'body': {'inside_fraction': fraction, 'out_of_frame': fraction < .95,
+                                            'method':'advisory projected 3D AABB; not mesh coverage'}}
+    flags = set(fit.get('flags', []))
+    flags.discard('out_of_frame')
+    flags.discard('body_out_of_frame')
+    if fraction < .95:flags.add('body_out_of_frame')
+    if not placement_frame.get('ok',True):flags.add('out_of_frame')
+    fit['flags'] = sorted(flags)
+    manual_pose.write_transformed(job / "fit", X, KP, ref["F"], fit)
+    timings["placement_cache_hit"] = cache_hit
+    timings["placement_s"] = round(time.monotonic() - stage, 3)
+    fit = read_json(job / "fit/fit.json")
+    fit["pose_text"] = request.get("pose_text", "")
+    props_value = request.get("props", "[]")
+    props_value = json.loads(props_value) if isinstance(props_value, str) else props_value
+    if not isinstance(props_value, list):
+        raise ValueError("props must be a JSON list")
+    fit["props_prompt"] = []
+    library = Path(config["farm_root"]) / "props"
+    for prop in props_value:
+        pid = location_id(prop.get("prop_id"))
+        meta = read_json(required_file(library / pid / "prop.json", "prop metadata"))
+        fit["props_prompt"].append(meta)
+    save_json(job / "fit/fit.json", fit)
+    required_file(job / "fit/body.obj", f"placement body.obj (status={fit.get('status')})")
+    h3_prompt = prompt_for(profile, config, fit)
+    body_h3_prompt = prompt_for(profile,config,{**fit,'props_prompt':[]}) if props_value else h3_prompt
+    scene = {"name": "pose", "body_obj": str(job / "fit/body.obj"),
+             "label_joints": str(job / "fit/label_joints.npz")}
+    save_json(job / "render_spec.json", {"scenes": [scene]})
+    stage = time.monotonic()
+    env = os.environ.copy()
+    env.setdefault("SCENE3D_BLENDER_SITE", str(Path(config["farm_root"]) / "runtime/blender_pkgs"))
+    if config.get("blender_pkgs"):
+        env["FARM_BPY_PKGS"] = config["blender_pkgs"]
+    run_stage(threeda_blender.command(config, HERE / "plate/render_plate_scene.py", ["--plate", plate_dir, "--spec", job / "render_spec.json",
+               "--mannequin", mannequin, "--out", job / "render", "--label-pass", "--photo-emission", "2.5",
+               "--samples", "48"]), "Blender render", env=env)
+    timings["render_s"] = round(time.monotonic() - stage, 3)
+    directory = job / "render/pose"
+    stage = time.monotonic()
+    prepare_images(directory, plate_dir / "plate_rgb.png", mode, body_path, strength, config["cell_px"])
+    if props_value:
+        from shutil import copy2
+        body_dir=directory/'body_guides';body_dir.mkdir(exist_ok=True)
+        for name in ('playblast.png','init.png','strength.png'):copy2(directory/name,body_dir/name)
+    else:
+        body_dir=directory
+    body_guides={key:str(body_dir/(key+'.png')) for key in ('playblast','init','strength')}
+    body_guides['plate']=str(directory/'plate.png')
+    body_guides.update(prompt=body_h3_prompt,render_prompt=h3_prompt)
+    render_props_value = []
+    if props_value:
+        # Input offsets use the same camera-horizontal location axes as body_*.
+        render_props_value = []
+        basis = manual_pose.location_basis(plate)
+        for prop in props_value:
+            prop = dict(prop)
+            if 'absolute_matrix_world' not in prop:
+                offset = basis @ np.asarray([prop.get(k, 0.) for k in "xyz"], dtype=float)
+                prop.update(dict(zip("xyz", offset.tolist())))
+            render_props_value.append(prop)
+        props_path = job / "props.json"
+        save_json(props_path, render_props_value)
+        overlay_dir = job / "props_render"
+        run_stage(threeda_blender.command(config, HERE / "plate/prop_render.py", ["--plate", plate_dir,
+                   "--body", job / "fit/body.obj", "--joints", job / "fit/label_joints.npz",
+                   "--props", props_path, "--library", library, "--out", overlay_dir]), "Blender props", env=env)
+        compose_props(directory, overlay_dir)
+        prop_report = read_json(overlay_dir / "props_render.json")
+        from PIL import Image
+        layer=Image.open(prop_report['textured_rgba']).convert('RGBA').resize((1344,768),Image.Resampling.LANCZOS)
+        layer.convert('RGB').save(directory/'prop_layer_rgb.png')
+        layer.getchannel('A').save(directory/'prop_layer_alpha.png')
+        body_guides.update(prop_rgb=str(directory/'prop_layer_rgb.png'),prop_alpha=str(directory/'prop_layer_alpha.png'))
+        fit["props"] = prop_report["props"]
+        fit["flags"] = sorted(set(fit.get("flags", []) + [flag for prop in prop_report["props"]
+                                    for flag, active in prop["flags"].items() if active]))
+        from prop_validation import include_props
+        include_props(fit)
+        save_json(job / "fit/fit.json", fit)
+    # Keep geometry diagnostics visible even in a saved preview, without painting
+    # them into init/playblast (which are H3 references).
+    from PIL import Image, ImageDraw, ImageFont
+    preview = Image.open(directory / 'debug.png').convert('RGB')
+    lines = [f"body out_of_frame={fraction < .95} bbox_inside={fraction:.4f}"]
+    for p in fit.get('props', []):
+        lines.append(f"prop {p['prop_id']}: source bbox {p.get('bbox_source_m')} m")
+        lines.append(f"prop final bbox {p.get('bbox_final_m')} m; dims {p.get('final_dimensions_m')}")
+        lines.append(f"prop out_of_frame={p['flags'].get('prop_out_of_frame')} inside={p.get('frame_inside_fraction')}")
+    surface = fit.get('surface_match', {})
+    if surface:
+        lines.append(f"support={surface.get('support_surface_id')} soft={surface.get('soft_surface_ids')}")
+    canvas = Image.new('RGB', (preview.width, preview.height + 24 * len(lines) + 10), '#141414')
+    canvas.paste(preview)
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default()
+    for i, line in enumerate(lines):
+        draw.text((8, preview.height + 5 + i * 24), line, fill='white', font=font)
+    canvas.save(directory / 'debug.png')
+    timings["maps_s"] = round(time.monotonic() - stage, 3)
+    timings["total_s"] = round(time.monotonic() - t0, 3)
+    from prop_validation import blocking_reasons
+    body_guides['validation']=dict(ok=not blocking_reasons(fit),reasons=blocking_reasons(fit))
+    save_json(job/'body_guides.json',body_guides)
+    return dict(status=fit["status"], **{key: str((directory / filename).resolve()) for key, filename in
+                {"playblast": "playblast.png", "init": "init.png", "strength": "strength.png",
+                 "silhouette": "silhouette.png", "debug": "debug.png"}.items()},
+                prop_repair=str(directory/'prop_repair.png') if props_value else None,
+                prop_repair_mask=str(directory/'prop_repair_mask.png') if props_value else None,
+                body_guides=body_guides,
+                scene_setup=dict(placement_key=key, body_obj=str(cache_dir/'body.obj'),
+                                 body_cache=str(cache_dir/'manual_base.npz'),
+                                 joints=str(cache_dir/'label_joints.npz'), location_id=profile.data['loc_id'],
+                                 plate_dir=str(plate_dir), props=render_props_value),
+                h3_prompt=h3_prompt, report=fit, timings=timings)
+
+
+def error_result(exc):
+    return {"status": "error", "error": stderr_tail(str(exc)),
+            "stderr_tail": stderr_tail(getattr(exc, "diagnostic", str(exc)))}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("location", "place"))
+    parser.add_argument("--request", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--geometry-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-worker", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    try:
+        request = read_json(args.request)
+        config = config_for(request)
+        if args.prompt_worker:
+            from types import SimpleNamespace
+            modules(config)
+            text = prompt_direct(SimpleNamespace(data=request["profile_data"]), config, request["fit"])
+            result = {"status": "ok", "h3_prompt": text}
+        elif args.geometry_worker or (args.worker and args.command == "location"):
+            result = (do_location if args.command == "location" else do_place)(request, config)
+        else:
+            # Node -> farm Python -> geometry Python for place+refine. Never import
+            # torch/SAM into the farm or calling ComfyUI environment.
+            executable = config["geometry_python"] if args.worker else config["python"]
+            worker_flag = "--geometry-worker" if args.worker else "--worker"
+            worker_out = Path(args.output).resolve().with_name(".pack-" + uuid.uuid4().hex + ".json")
+            try:
+                run_stage([executable, "-I", Path(__file__).resolve(), args.command,
+                           "--request", Path(args.request).resolve(), "--output", worker_out, worker_flag], "farm worker")
+                result = read_json(required_file(worker_out, "worker result"))
+            finally:
+                worker_out.unlink(missing_ok=True)
+    except (Exception, SystemExit) as exc:
+        result = error_result(exc)
+    save_json(args.output, result)
+    # Node errors are a normal JSON outcome, not an exception that aborts the graph.
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

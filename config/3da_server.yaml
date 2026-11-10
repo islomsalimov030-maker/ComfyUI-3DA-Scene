@@ -1,0 +1,16 @@
+# 3DA Scene configuration template (no studio paths, no URLs, no secrets).
+# data_root empty => <ComfyUI>/user/default/3da_data (env THREEDA_DATA_ROOT overrides).
+# A private config elsewhere can be selected with env THREEDA_CONFIG.
+data_root: null
+# Blender: on Python 3.13 the bpy wheel (installed by install.py) runs in a separate process.
+# Otherwise set blender_path to a Blender 5.x binary. blender_mode: auto | binary
+blender_mode: auto
+blender_path: ''
+cache_dir: cache
+mannequin: assets/mannequin_162.blend
+cell_px: 16
+location_hints_by_id: {}
+prompt_context_by_location: {}
+# Optional, PC only: a remote ComfyUI for 3DAH3Remote. Empty by default.
+# h3_remote:
+#   url: ''
