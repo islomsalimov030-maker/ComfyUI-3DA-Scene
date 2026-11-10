@@ -37,6 +37,7 @@ DEFAULT_SUPPORT = {
     "sit_tucked": ["pelvis", "thigh.L", "thigh.R"], "sit_floor": ["pelvis"],
     "recline": ["pelvis"], "lie": ["pelvis", "torso", "thigh.L", "thigh.R"],
     "all_fours": ["knee.L", "knee.R"],
+    "auto": ["reference"],
 }
 
 
@@ -505,9 +506,9 @@ def do_place(request, config):
             raise ValueError("target ID conflicts with instance_hint")
         spec.instance_hint = explicit["id"]
         spec.target_object = explicit.get("type", explicit.get("name", "other"))
-    if profile.data.get("auto_surfaces", {}).get("floor_status") not in (None, "ok"):
+    if pc != 'auto' and spec.target_object == 'floor' and profile.data.get("auto_surfaces", {}).get("floor_status") not in (None, "ok"):
         raise ValueError("auto profile floor is ambiguous; explicit floor preparation required before placement")
-    seed = seed_for(profile, spec, config)
+    seed = np.zeros(3) if pc == 'auto' else seed_for(profile, spec, config)
     # Validate required prompt metadata before spending GPU time.
     prompt_for(profile, config, {"shot_spec": spec.to_dict()})
     cache = Path(config.get("cache_dir", str(Path(config["farm_root"]) / "cache"))) / "pose_ref" / hashlib.sha256(pose.read_bytes()).hexdigest()
@@ -543,8 +544,12 @@ def do_place(request, config):
     cache_hit = base is not None
     if base is None:
         np.random.seed(seed_value % (2 ** 32))
-        refine_ctx = refine.load_ctx(config["comfy"])
-        result = place.place(ref, plate, spec, seed, height, profile=profile,
+        if pc == 'auto':
+            import reference_place
+            result = reference_place.place(ref, plate, profile, spec, height)
+        else:
+            refine_ctx = refine.load_ctx(config["comfy"])
+            result = place.place(ref, plate, spec, seed, height, profile=profile,
                              body_src="profile" if body else "proxy", dims_override=body["body_dims"] if body else None,
                              refine_ctx=refine_ctx, trace_dir=job/'trace')
         manual_pose.save_placement(cache_dir, result, ref, plate, spec, key)
@@ -556,7 +561,11 @@ def do_place(request, config):
         from scene_edit import body_delta
         values['body_matrix'] = body_delta(request['body_transform'], key)
     if 'body_matrix' in values or any(float(v) != 0 for v in values.values()):
-        X, KP, fit = manual_pose.revalidate(base, ref, plate, profile, spec, seed, height, values)
+        if pc == 'auto':
+            import reference_place
+            X, KP, fit = reference_place.revalidate(base, plate, profile, spec, values)
+        else:
+            X, KP, fit = manual_pose.revalidate(base, ref, plate, profile, spec, seed, height, values)
     else:
         X, KP, fit = base["X"], base["KP"], base["report"]
     # Advisory frame coverage of the projected 3D bbox, not fraction of vertices.
