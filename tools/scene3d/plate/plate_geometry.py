@@ -265,8 +265,8 @@ def choose_floor(points, normals_pred, valid, H, rng):
     old = fit_floor(points, normals_pred, valid, H, rng)
     if old is not None:
         n, d, n_in, n_cand = old
-        same_up = float(n @ n2) > np.cos(np.radians(8))
-        same_floor = report["visible"] and abs(float(d) - d2) <= LEVEL_TOL
+        same_up = bool(float(n @ n2) > np.cos(np.radians(8)))
+        same_floor = bool(report["visible"] and abs(float(d) - d2) <= LEVEL_TOL)
         if same_up and same_floor:
             report.update(source="ransac_lower", up_source="floor", inliers=n_in, candidates=n_cand)
             return n, float(d), report
@@ -363,7 +363,8 @@ def main():
         "mesh": {"verts": int(keep.sum()), "faces": len(faces), "stride": s},
     }
     with open(os.path.join(a.out, "plate.json"), "w") as fh:
-        json.dump(info, fh, indent=1)
+        # numpy scalars (np.bool_, np.int64, np.float32) — как обычные числа (0.2.0.1: bool ронял plate.json).
+        json.dump(info, fh, indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     print(f"[plate] cam height {cam_h:.2f} m, fov_x {info['fov_x_deg']:.1f} deg, lens {info['lens_mm']:.1f} mm, "
           f"depth {info['depth_m']['p1']:.2f}-{info['depth_m']['p99']:.2f} m, floor {floor_report['source']} {floor_report['inliers']}/{floor_report['candidates']}, "
           f"mesh {info['mesh']['verts']} v / {len(faces)} f")
