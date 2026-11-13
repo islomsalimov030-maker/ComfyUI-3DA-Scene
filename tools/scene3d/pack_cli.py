@@ -45,11 +45,23 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def plain(value):
+    """0.3.1: numpy scalars/arrays (np.bool is named «bool» in numpy 2) are written as plain JSON values.
+    A new pose put a numpy bool into the scene report and the whole preparation fell back (13.11)."""
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def save_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False, default=plain), encoding="utf-8")
     tmp.replace(path)
 
 
