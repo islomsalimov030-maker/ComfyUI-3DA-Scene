@@ -28,6 +28,15 @@ def body_matrix(value):
     return m
 
 
+def prop_matrix(value):
+    """Props keep their proportions: positive uniform scale + rotation + translation."""
+    m = validate_matrix(value)
+    scale = float(np.cbrt(np.linalg.det(m[:3,:3])))
+    if scale <= 1e-8 or not np.allclose((m[:3,:3] / scale).T @ (m[:3,:3] / scale), np.eye(3), atol=1e-4):
+        raise ValueError('3DA: масштаб предмета должен быть равномерным; растяжение по одной оси запрещено')
+    return m
+
+
 def body_delta(text, placement_key):
     data = json.loads(text)
     if data.get('placement_key') != placement_key:
@@ -35,15 +44,25 @@ def body_delta(text, placement_key):
     return body_matrix(data['matrix']).tolist()
 
 
+FIRST_GROUP_1 = '3DA: Сначала выполните группу 1 (подготовка сцены)'
+
+
 def read_manifest(value, cfg):
     root = (Path(cfg['farm_root']) / 'cache/editor').resolve()
-    path = Path(value).resolve(strict=True)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(FIRST_GROUP_1 + ': manifest пуст')
+    try:
+        path = Path(value.strip()).resolve(strict=True)
+    except OSError:
+        raise ValueError(FIRST_GROUP_1 + ': manifest сцены не найден') from None
     if not path.is_relative_to(root) or path.name != 'manifest.json':
         raise ValueError('3DA: выберите manifest подготовленной сцены')
     return json.loads(path.read_text(encoding='utf-8'))
 
 
 def check_file(asset, manifest):
+    if asset is None or not hasattr(asset, 'get_data'):
+        raise ValueError(FIRST_GROUP_1 + ': в 3D-окне нет сцены (model_file пуст)')
     with asset.get_data() as stream:
         digest = hashlib.sha256(stream.read()).hexdigest()
     if digest != manifest['sha256']:
@@ -63,7 +82,7 @@ def edits(manifest, models):
             delta = body_matrix(matrix @ np.linalg.inv(np.asarray(entity['matrix_world'])))
             body = json.dumps(dict(placement_key=manifest['placement_key'], matrix=delta.tolist()))
         elif entity['kind'] == 'prop':
-            props.append({**entity['prop'], 'absolute_matrix_world': matrix.tolist()})
+            props.append({**entity['prop'], 'absolute_matrix_world': prop_matrix(matrix).tolist()})
         else:
             raise ValueError('3DA: неизвестный объект сцены')
     if body is None:
@@ -111,5 +130,14 @@ def export(setup, cfg):
     background_path = Path(cfg['comfy'])/'input'/background_name
     if not background_path.exists():
         copy2(Path(setup['plate_dir'])/'plate_rgb.png', background_path)
+    # The room geometry the renderer occludes with: the 3D window uses it as a
+    # depth-only occluder and checks placement against its surfaces (0.2.0).
+    room_source = Path(setup['plate_dir'])/'plate_mesh.obj'
+    room_name = 'room_' + hashlib.sha256(room_source.read_bytes()).hexdigest()[:16] + '.obj'
+    room_path = Path(cfg['comfy'])/'input'/'3d/3da_scene'/room_name
+    if not room_path.exists():
+        copy2(room_source, room_path)
+    raster = [1344, 768]
     return dict(model_file=model_file, manifest=str(manifest_path), entities=manifest['entities'],
-                camera=camera_config(plate,[1344,768]), background=background_name)
+                camera=camera_config(plate,raster), raster=raster, background=background_name,
+                room_mesh='3d/3da_scene/'+room_name)
