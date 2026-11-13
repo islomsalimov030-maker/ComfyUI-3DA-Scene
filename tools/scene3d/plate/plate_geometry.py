@@ -362,9 +362,13 @@ def main():
         "depth_m": {"p1": float(np.percentile(dep[valid], 1)), "p99": float(np.percentile(dep[valid], 99))},
         "mesh": {"verts": int(keep.sum()), "faces": len(faces), "stride": s},
     }
-    with open(os.path.join(a.out, "plate.json"), "w") as fh:
-        # numpy scalars (np.bool_, np.int64, np.float32) — как обычные числа (0.2.0.1: bool ронял plate.json).
+    # 0.2.1: numpy scalars (np.bool_ ...) as plain values; 0.3.0: atomic write — a crash never leaves
+    # a half-written plate.json that later preparations would read as a ready location.
+    target = os.path.join(a.out, "plate.json")
+    tmp = target + ".%d.tmp" % os.getpid()
+    with open(tmp, "w") as fh:
         json.dump(info, fh, indent=1, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+    os.replace(tmp, target)
     print(f"[plate] cam height {cam_h:.2f} m, fov_x {info['fov_x_deg']:.1f} deg, lens {info['lens_mm']:.1f} mm, "
           f"depth {info['depth_m']['p1']:.2f}-{info['depth_m']['p99']:.2f} m, floor {floor_report['source']} {floor_report['inliers']}/{floor_report['candidates']}, "
           f"mesh {info['mesh']['verts']} v / {len(faces)} f")
