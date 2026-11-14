@@ -985,6 +985,69 @@ def scene_helpers():
 FIRST_STEP = 'нет сцены — сначала выполните шаг 1 (подготовка сцены)'
 
 
+MASK_GROW = .015  # 0.3.26: запас маски — доля короткой стороны кадра (тест 14.11: ≈16 px на 1072)
+
+
+def mask_present(mask, threshold=.02):
+    """0.3.26: маска с «Фото 1» не пустая. LoadImage без альфа-канала отдаёт нули 64×64."""
+    return (isinstance(mask, torch.Tensor) and mask.numel() > 0 and bool(torch.isfinite(mask).all())
+            and float(mask.max()) > threshold)
+
+
+def resize_image(image, width, height):
+    if tuple(image.shape[1:3]) == (height, width):
+        return image
+    try:
+        import comfy.utils
+        out = comfy.utils.common_upscale(image.movedim(-1, 1), width, height, 'lanczos', 'disabled')
+    except ImportError:  # тесты без ComfyUI
+        import torch.nn.functional as F
+        out = F.interpolate(image.movedim(-1, 1), size=(height, width), mode='bicubic', antialias=True,
+                            align_corners=False)
+    return out.movedim(1, -1).clamp(0, 1)
+
+
+def resize_mask(mask, width, height):
+    import torch.nn.functional as F
+    mask = mask.detach().to(torch.float32).cpu()
+    mask = (mask if mask.ndim == 3 else mask.reshape((-1,) + tuple(mask.shape[-2:])))[:1]
+    if tuple(mask.shape[1:3]) == (height, width):
+        return mask.clamp(0, 1)
+    return F.interpolate(mask[:, None], size=(height, width), mode='bilinear', align_corners=False)[:, 0].clamp(0, 1)
+
+
+def raster_size(width, height, megapixels, step=32):
+    """0.3.26: тот же растр, что ImageScaleToTotalPixels (resolution_steps 32) в ветке ref2v."""
+    scale = math.sqrt(float(megapixels) * 1024 * 1024 / (width * height))
+    return max(step, round(width * scale / step) * step), max(step, round(height * scale / step) * step)
+
+
+def mask_grow_px(height, width):
+    return max(2, int(round(MASK_GROW * min(height, width))))
+
+
+def mask_core(mask, width, height):
+    m = resize_mask(mask, width, height)[0].numpy()
+    return m > .02 * max(float(m.max()), 1e-6)
+
+
+def mask_strength(mask, width, height):
+    """0.3.26: маска генерации на растре H3: сплошная 1.0 в маске и запасе MASK_GROW, край ~2 px.
+    Запас нужен, чтобы новой вещи было куда выйти за кисть (рукав, край одежды)."""
+    from scipy.ndimage import binary_dilation
+    grown = binary_dilation(mask_core(mask, width, height), iterations=mask_grow_px(height, width))
+    return sampling_mask(torch.from_numpy(grown.astype(np.float32))[None])
+
+
+def mask_paste(mask, width, height):
+    """0.3.26: маска вклейки в размере «Фото 1»: 1.0 в маске и запасе, мягкий край ещё на ~пол-запаса наружу."""
+    from scipy.ndimage import binary_dilation, gaussian_filter
+    grow = mask_grow_px(height, width)
+    hard = binary_dilation(mask_core(mask, width, height), iterations=grow)
+    soft = gaussian_filter(binary_dilation(hard, iterations=max(1, grow // 2)).astype(np.float32), sigma=max(1., grow / 4))
+    return torch.from_numpy(np.clip(np.maximum(soft, hard.astype(np.float32)), 0, 1).astype(np.float32))[None]
+
+
 def sampling_mask(strength, threshold=.02, edge_px=2.):
     """0.3.13: маска для DifferentialDiffusion без дробных значений внутри области H3.
     DD открывает пиксель силы m, только когда нормированный шаг шума опустится ниже m. При shift 12 шум почти
@@ -1078,9 +1141,18 @@ class NativeGuides:
                              'user_refs': ('INT', {'default': 3, 'min': 0, 'max': 3,
                                  'tooltip': 'Сколько доп. фото (Фото 4…) подключено к H3 3DA после плиты и эталона'}),
                              'mode': ('INT', {'default': 2, 'min': 1, 'max': 2,
-                                              'tooltip': '1 = обычное фото AIO (3DA не считается), 2 = постановка 3DA'})}}
-    RETURN_TYPES = ('IMAGE', 'IMAGE', 'IMAGE', 'MASK', 'STRING', 'INT', 'INT', 'BOOLEAN', 'INT', 'STRING')
-    RETURN_NAMES = ('plate', 'playblast', 'init', 'strength', 'prompt', 'width', 'height', 'accepted', 'mode', 'status')
+                                              'tooltip': '1 = обычное фото AIO (3DA не считается), 2 = постановка 3DA'}),
+                             # 0.3.26: режим маски — маска нарисована на «Фото 1», 3D-контроль выключен.
+                             'image': ('IMAGE', {'tooltip': '«Фото 1 · исходный кадр» — для режима маски'}),
+                             'mask': ('MASK', {'tooltip': 'Маска с «Фото 1» (MaskEditor). Не пустая и 3D-контроль '
+                                                          'выключен → H3 перерисует только её'}),
+                             'megapixels': ('FLOAT', {'default': 1.0, 'min': .25, 'max': 8., 'step': .05,
+                                                      'forceInput': True,
+                                                      'tooltip': 'Мегапиксели пульта — растр H3 в режиме маски'})}}
+    RETURN_TYPES = ('IMAGE', 'IMAGE', 'IMAGE', 'MASK', 'STRING', 'INT', 'INT', 'BOOLEAN', 'INT', 'STRING',
+                    '3DA_BODY_GUIDES')
+    RETURN_NAMES = ('plate', 'playblast', 'init', 'strength', 'prompt', 'width', 'height', 'accepted', 'mode', 'status',
+                    'guides')
     FUNCTION = 'execute'
     CATEGORY = '3DA/native'
 
@@ -1099,10 +1171,43 @@ class NativeGuides:
     def stub(status):
         blank = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
         return (blank, blank.clone(), blank.clone(), torch.zeros((1, 64, 64), dtype=torch.float32), '', 64, 64,
-                False, 1, status)
+                False, 1, status, {})
 
-    def execute(self, body_guides=None, frame_prompt='', user_refs=3, mode=2):
+    @staticmethod
+    def mask_mode(image, mask, frame_prompt, user_refs, megapixels):
+        """0.3.26: режим маски через ветку 3DA: плита = init = «видео» = Фото 1 в растре пульта, сила = маска.
+        <Video 1> — неподвижная копия фото (тест 14.11: без неё результат тот же, а ветку не надо перестраивать)."""
+        import sys
+        sys.path.insert(0, str(Path(config()['repo']) / 'tools/scene3d'))
+        import prompt_h3
+        if not isinstance(image, torch.Tensor) or image.ndim != 4 or image.shape[-1] != 3 or not torch.isfinite(image).all():
+            raise ValueError('3DA: режим маски — нет картинки «Фото 1»')
+        source = image[:1].detach().to(torch.float32).cpu()
+        sh, sw = source.shape[1:3]
+        width, height = raster_size(sw, sh, megapixels)
+        plate = resize_image(source, width, height)
+        paste = mask_paste(mask, sw, sh)
+        prompt = prompt_h3.mask_prompt(frame_prompt, int(user_refs))
+        share = float((paste > .5).float().mean())
+        status = f'Режим маски: H3 перерисует закрашенное на «Фото 1» (≈{share:.0%} кадра), остальное — из исходника'
+        if not (frame_prompt or '').strip():
+            status += ' — Предупреждение: промпт кадра пустой, опишите, что нарисовать в маске'
+        if share > .6:
+            status += ' — Предупреждение: маска больше 60 % кадра, перерисуется почти весь кадр'
+        guides = {'mask_mode': True, 'source': source, 'paste': paste, 'grow_px': mask_grow_px(sh, sw)}
+        return (plate, plate.clone(), plate.clone(), mask_strength(mask, width, height), prompt, width, height,
+                True, 2, status, guides)
+
+    def execute(self, body_guides=None, frame_prompt='', user_refs=3, mode=2, image=None, mask=None, megapixels=1.0):
+        has_mask = mask_present(mask)
         if self.wanted_mode(mode) == 1:
+            if has_mask:
+                try:
+                    return self.mask_mode(image, mask, frame_prompt, user_refs, megapixels)
+                except Exception as exc:
+                    text = str(exc)
+                    text = (text[5:] if text.startswith('3DA: ') else text).splitlines()[0][:240] if text else 'ошибка'
+                    return self.stub('Режим маски не сработал: ' + text + ' — сделано обычное фото без маски')
             return self.stub('Режим 1: обычное фото AIO (3DA выключен)')
         try:
             g = accepted_guides(body_guides)
@@ -1116,12 +1221,14 @@ class NativeGuides:
             status = '3DA: сцена готова, H3 запущен'
             if warnings:
                 status += ' — Предупреждение (MiniMax исправит): ' + '; '.join(warnings)
+            if has_mask:
+                status += ' — маска на «Фото 1» не используется: включён 3D-контроль'
             strength = g['strength']
             if g.get('clean_shadows'):
                 # 0.3.13: при «чистых тенях» H3 получает сплошную маску (1.0 во всей области, край ~6 px).
                 strength = sampling_mask(strength)
             return (g['plate'], g['playblast'], g['init'], strength, prompt, g['plate'].shape[2],
-                    g['plate'].shape[1], True, 2, status)
+                    g['plate'].shape[1], True, 2, status, g)
         except Exception as exc:
             return self.stub('3DA не сработал: ' + fallback_reason(body_guides, exc) + ' — сделано обычное фото')
 
@@ -1137,12 +1244,19 @@ class NativeComposite:
         return {'required': {'image': ('IMAGE',)},
                 'optional': {'body_guides': ('3DA_BODY_GUIDES',), 'prop_repair': ('IMAGE',), 'prop_repair_mask': ('MASK',),
                              # 0.3.12: маска человека с кадра H3 (SAM3 «person») — для «чистых теней»; без неё — силуэт рендера.
-                             'person_mask': ('MASK', {'tooltip': 'Необязательно: маска Стейси на кадре H3 (SAM3Segment «person»). '
+                             # 0.3.26: ленивый — в режиме маски SAM3 «person» не считается.
+                             'person_mask': ('MASK', {'lazy': True,
+                                                      'tooltip': 'Необязательно: маска Стейси на кадре H3 (SAM3Segment «person»). '
                                                                  'Нужна только для «чистых теней (тест)».'})}}
     RETURN_TYPES = ('IMAGE', 'MASK', 'STRING')
     RETURN_NAMES = ('final', 'composite_support', 'metrics')
     FUNCTION = 'execute'
     CATEGORY = '3DA/native'
+
+    def check_lazy_status(self, image=None, body_guides=None, person_mask=None, **kwargs):
+        if isinstance(body_guides, dict) and body_guides.get('mask_mode'):
+            return []
+        return ['person_mask'] if person_mask is None else []
 
     def execute(self, image, body_guides=None, prop_repair=None, prop_repair_mask=None, person_mask=None):
         # 0.3.0: вклейка никогда не роняет финал — при любой проблеме отдаём кадр H3 как есть.
@@ -1154,6 +1268,8 @@ class NativeComposite:
                                            ensure_ascii=False)
 
     def compose(self, image, body_guides, prop_repair, prop_repair_mask, person_mask=None):
+        if isinstance(body_guides, dict) and body_guides.get('mask_mode'):
+            return self.compose_mask(image, body_guides)
         g = accepted_guides(body_guides)
         if image.shape != g['plate'].shape or not torch.isfinite(image).all():
             raise ValueError('3DA: final image must match geometry raster')
@@ -1224,6 +1340,25 @@ class NativeComposite:
         return final,full_support.float().cpu(),json.dumps(metrics)
 
 
+
+    @staticmethod
+    def compose_mask(image, g):
+        """0.3.26: режим маски — кадр H3 в размер «Фото 1», вклейка по мягкой маске; вне маски — исходник без изменений."""
+        if not isinstance(image, torch.Tensor) or image.ndim != 4 or not torch.isfinite(image).all():
+            raise ValueError('3DA: кадр H3 повреждён')
+        source = g['source'].to(image.device)
+        paste = g['paste'].to(image.device)
+        sh, sw = source.shape[1:3]
+        if tuple(paste.shape) != (1, sh, sw):
+            raise ValueError('3DA: маска вклейки не совпадает с «Фото 1»')
+        generated = resize_image(image[:1].to(torch.float32), sw, sh)
+        support = paste > 0
+        final = torch.where(support[..., None], source * (1 - paste[..., None]) + generated * paste[..., None], source)
+        changed = int((final != source).any(-1)[~support].sum())
+        metrics = dict(mode='mask', source_hw=[sh, sw], working_raster_hw=list(image.shape[1:3]),
+                       mask_px=int((paste >= 1).sum()), support_px=int(support.sum()), grow_px=g.get('grow_px'),
+                       outside_changed_pixels=changed, outside_passed=changed == 0)
+        return final, support.float().cpu(), json.dumps(metrics)
 
     def compose_h3(self, image, g, person_mask=None):
         """0.3.6: тело и предмет нарисовал H3 (с тенями) — вне области силы возвращаем чистую комнату, без вклейки."""

@@ -153,7 +153,14 @@ def user_label(n):
     return f'<Picture {n - 1}>'
 
 
-def merge_frame_prompt(scene_prompt, frame_prompt, user_refs=3):
+def mask_label(n):
+    """0.3.26: метка пользователя AIO → H3 в режиме маски. Комната и поза — это само фото (<Picture 1>);
+    <Picture 2> в H3 — эталон личности; доп. фото (Фото 4…) → <Picture 3…>."""
+    n = int(n)
+    return '<Picture 1>' if n <= 3 else f'<Picture {n - 1}>'
+
+
+def merge_frame_prompt(scene_prompt, frame_prompt, user_refs=3, label=user_label):
     """0.2.0 «в»: промпт кадра пользователя (узел 2) поверх промпта сцены 3DA.
 
     Метки пользователя переводятся по user_label (0.3.19; до 0.3.19 был сдвиг +1 для N≥2 — неверный для AIO V3).
@@ -165,7 +172,7 @@ def merge_frame_prompt(scene_prompt, frame_prompt, user_refs=3):
     if not frame:
         return scene_prompt
     frame = IMAGE_N.sub(lambda m: f'<Picture {m.group(1)}>', frame)
-    frame = PICTURE_N.sub(lambda m: user_label(m.group(1)), frame)
+    frame = PICTURE_N.sub(lambda m: label(m.group(1)), frame)
     top = max([int(n) for n in PICTURE_N.findall(frame)] + [0])
     if top > 2 + user_refs:
         raise ValueError(f'3DA: промпт кадра ссылается на <Picture {top + 1}> пользователя (Фото {top + 1}), '
@@ -215,3 +222,41 @@ def require_lint(text, video, connected=None):
     if any(i.startswith("error:") for i in issues):
         raise ValueError(f"H3 lint failed: {issues}; no GPU submission")
     return issues
+
+
+# 0.3.26: режим маски (маска на «Фото 1», 3D-контроль выключен). Ветка 3DA: <Picture 1> — само фото,
+# <Picture 2> — эталон личности, <Video 1> — неподвижная копия фото. Описание пользователя встаёт после [Shot 1].
+MASK_SCENE = (
+    "subject_definitions:\n"
+    "<Subject 1> is the adult woman in <Picture 1>; her facial identity is also shown in <Picture 2>.\n"
+    "<Picture 1> is the photograph being edited: the exact composition, room, people, pose and lighting of the shot.\n"
+    "<Picture 2> supplies only the facial identity of <Subject 1> and never appears as a separate image in the shot.\n"
+    "<Video 1> is a still copy of <Picture 1> and only confirms its composition.\n"
+    "summary:\n"
+    "[reference generation] One single photograph. <Picture 2> is only an identity reference sheet, not a layout. "
+    "The shot reproduces <Picture 1> exactly and changes only the local detail named in the description.\n"
+    "retention_analysis:\n"
+    "<Picture 1>: partially_preserved - everything outside the change named in the description stays exactly as in <Picture 1>.\n"
+    "<Subject 1>: partially_preserved - her identity, body pose, position and size stay as in <Picture 1>; "
+    "only what the description changes is new.\n"
+    "<Picture 2>: attribute_transfer - transfer facial identity to <Subject 1>.\n"
+    "<Video 1>: weak_reference - composition only.\n"
+    "detailed_description:\n"
+    "A photorealistic live-action still. [Shot 1] The shot begins from <Picture 1> and keeps its exact composition, "
+    + STATIC + " "
+    "Her body pose, position, size and facial identity stay exactly as in <Picture 1>, and the room, the furniture "
+    "and every other object stay exactly as in <Picture 1>. True-to-life scale: she keeps exactly her size from "
+    "<Picture 1>; she is never enlarged to fill the frame. The changed detail follows the light, shadows and "
+    "perspective of <Picture 1> and fits naturally on her body or in the room. Her hands keep natural human anatomy "
+    "with five separate fingers on each hand. The lighting is preserved unchanged throughout. Colors and saturation "
+    "stay unchanged from the reference image. One continuous shot with no cuts and no close-up inserts; <Picture 2> "
+    "is only a reference for her face and never appears on screen.\n"
+    "overall_soundscape:\n"
+    "Quiet room tone with no speech.\n"
+    "non_diegetic_music:\n"
+    "N/A")
+
+
+def mask_prompt(frame_prompt, user_refs=3):
+    """0.3.26: промпт H3 режима маски: шаблон MASK_SCENE + описание пользователя (узел 2)."""
+    return merge_frame_prompt(MASK_SCENE, frame_prompt, user_refs, label=mask_label)
