@@ -322,7 +322,9 @@ function only3da(node) {
 }
 function applyControl(graph) {
   const control = controlNode(graph);
-  if (!control) return;
+  // 0.3.27: блок фото заглушён целиком (rgthree «ФОТО — весь блок» глушит и сам 3D-контроль) — шаги не трогаем,
+  // иначе перед Run группа «▶ Генерация» включилась бы обратно и фото считалось бы при выключенном блоке.
+  if (!control || control.mode === 2 || control.mode === 4) return;
   const on = !!widgetValue(control, 'control_3d', true);
   const step = widgetValue(control, 'step', 'Генерация');
   const prep = on && String(step).startsWith('Подготов');
@@ -371,23 +373,41 @@ function migrateControl(node, info, defaults) {
   node.setDirtyCanvas?.(true, true);
   console.info(`[3DA] 3DAControl #${node.id}: старая раскладка ручек переведена в новую`);
 }
-// Тонкая линия на всю ширину над первым тонким виджетом и подпись «тонкие настройки» справа над ней.
+// Подпись «тонкие настройки» по центру строки-разделителя, линия слева и справа.
+// 0.3.27: место под строку даёт отступ (FINE_GAP) у последней основной ручки — подпись больше не прячется под полем.
+const FINE_GAP = 16;
+function fineGap(node, first) {
+  const ws = node.widgets ?? [];
+  const prev = ws[ws.indexOf(first) - 1];
+  if (!prev || prev.__ngFineGap) return;
+  prev.__ngFineGap = true;
+  const base = prev.computeSize;
+  prev.computeSize = function (width) {
+    const s = base ? base.call(this, width) : [width ?? 0, LiteGraph.NODE_WIDGET_HEIGHT];
+    return [s[0], s[1] + FINE_GAP];
+  };
+}
 function drawFineDivider(node, ctx, first) {
-  if (!first || node.flags?.collapsed || first.hidden || typeof first.last_y !== 'number') return;
-  const y = first.last_y - 3;
+  if (!first || node.flags?.collapsed || first.hidden) return;
+  const top = typeof first.y === 'number' ? first.y : first.last_y;
+  if (typeof top !== 'number') return;
+  const y = top - FINE_GAP / 2 - 2;
   const wdt = node.size[0];
+  const label = 'тонкие настройки';
   ctx.save();
-  ctx.strokeStyle = '#888';
+  ctx.font = '10px sans-serif';
+  const tw = ctx.measureText(label).width;
+  const x0 = (wdt - tw) / 2;
+  ctx.strokeStyle = '#777';
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(0, y);
-  ctx.lineTo(wdt, y);
+  ctx.moveTo(10, y); ctx.lineTo(x0 - 6, y);
+  ctx.moveTo(x0 + tw + 6, y); ctx.lineTo(wdt - 10, y);
   ctx.stroke();
-  ctx.fillStyle = '#888';
-  ctx.font = '10px sans-serif';
-  ctx.textAlign = 'right';
-  ctx.textBaseline = 'bottom';
-  ctx.fillText('тонкие настройки', wdt - 8, y - 1);
+  ctx.fillStyle = '#999';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, x0, y);
   ctx.restore();
 }
 
@@ -432,6 +452,7 @@ app.registerExtension({
     // 0.3.25: основные ручки сверху, тонкие (⚙) — под линией «тонкие настройки».
     const fine = (node.widgets ?? []).filter(w => FINE_3DA.includes(w.name));
     for (const w of fine) if (!String(w.label ?? '').startsWith('⚙ ')) w.label = '⚙ ' + (w.label ?? w.name);
+    if (fine[0]) fineGap(node, fine[0]);
     const odf = node.onDrawForeground;
     node.onDrawForeground = function (ctx, ...rest) {
       const r = odf?.apply(this, [ctx, ...rest]);

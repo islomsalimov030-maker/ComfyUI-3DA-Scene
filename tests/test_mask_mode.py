@@ -86,7 +86,7 @@ def test_composite_mask_mode():
 
 
 def test_mask_prompt_labels():
-    text = prompt_h3.mask_prompt('Use the sweater from <Picture 4>, room as in <Picture 2>.', 1)
+    text = prompt_h3.mask_prompt('Use the sweater from <Picture 3>, room as in <Picture 1>.', 1)
     assert '<Picture 3> is a reference image' in text and 'room as in <Picture 1>' in text
     assert not [i for i in prompt_h3.lint(text, True, CONNECTED | {'<Picture 3>'}) if i.startswith('error')]
     try:
@@ -96,3 +96,9 @@ def test_mask_prompt_labels():
     else:
         raise AssertionError('лишняя метка должна давать ошибку')
     assert prompt_h3.mask_prompt('', 1) == prompt_h3.MASK_SCENE
+
+
+def test_aio_v331_labels():
+    P = prompt_h3
+    assert [P.user_label(n) for n in (1, 2, 3, 4, 5)] == ['<Picture 1>', '<Video 1>', '<Picture 3>', '<Picture 4>', '<Picture 5>']
+    assert [P.mask_label(n) for n in (1, 2, 3, 5)] == ['<Picture 1>', '<Picture 1>', '<Picture 3>', '<Picture 5>']

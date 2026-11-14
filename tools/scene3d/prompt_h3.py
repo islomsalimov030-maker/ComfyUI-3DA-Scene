@@ -141,30 +141,30 @@ def _sections(text):
 
 
 def user_label(n):
-    """0.3.19: метка пользователя AIO V3 → метка в H3 ветки 3DA.
-    AIO: <Picture 1> исходный кадр, <Picture 2> комната, <Picture 3> поза, <Picture 4…> доп. фото.
-    3DA: <Picture 1> плита (= комната), <Picture 2> эталон личности, <Picture 3…> доп. фото (Фото 4…);
+    """0.3.27: метка пользователя AIO V3.3.1 → метка в H3 ветки 3DA.
+    AIO: <Picture 1> локация, <Picture 2> поза, <Picture 3…5> доп. фото (Фото 3…5).
+    3DA: <Picture 1> плита (= локация), <Picture 2> эталон личности, <Picture 3…5> доп. фото;
     фото позы в H3 3DA не идёт (поза — из 3D-рендера <Video 1>, иначе H3 тянет из фото позы черты чужого лица)."""
     n = int(n)
-    if n <= 2:
+    if n <= 1:
         return '<Picture 1>'
-    if n == 3:
+    if n == 2:
         return '<Video 1>'
-    return f'<Picture {n - 1}>'
+    return f'<Picture {n}>'
 
 
 def mask_label(n):
-    """0.3.26: метка пользователя AIO → H3 в режиме маски. Комната и поза — это само фото (<Picture 1>);
-    <Picture 2> в H3 — эталон личности; доп. фото (Фото 4…) → <Picture 3…>."""
+    """0.3.27: метка пользователя AIO → H3 в режиме маски. Локация и поза — это само фото (<Picture 1>);
+    <Picture 2> в H3 — эталон личности; доп. фото (Фото 3…5) → <Picture 3…5>."""
     n = int(n)
-    return '<Picture 1>' if n <= 3 else f'<Picture {n - 1}>'
+    return '<Picture 1>' if n <= 2 else f'<Picture {n}>'
 
 
 def merge_frame_prompt(scene_prompt, frame_prompt, user_refs=3, label=user_label):
     """0.2.0 «в»: промпт кадра пользователя (узел 2) поверх промпта сцены 3DA.
 
     Метки пользователя переводятся по user_label (0.3.19; до 0.3.19 был сдвиг +1 для N≥2 — неверный для AIO V3).
-    user_refs — сколько доп. фото (Фото 4…) подключено к H3 3DA после плиты и эталона.
+    user_refs — сколько доп. фото (Фото 3…5) подключено к H3 3DA после плиты и эталона.
     Промпт без секций — описание кадра (одежда, выражение, детали): вставляется в detailed_description
     после [Shot 1]. Промпт с секциями — строки субъектов, сохранения, описание и звук добавляются по секциям.
     Камера, свет, цвет, поза и место остаются из промпта сцены."""
@@ -175,7 +175,7 @@ def merge_frame_prompt(scene_prompt, frame_prompt, user_refs=3, label=user_label
     frame = PICTURE_N.sub(lambda m: label(m.group(1)), frame)
     top = max([int(n) for n in PICTURE_N.findall(frame)] + [0])
     if top > 2 + user_refs:
-        raise ValueError(f'3DA: промпт кадра ссылается на <Picture {top + 1}> пользователя (Фото {top + 1}), '
+        raise ValueError(f'3DA: промпт кадра ссылается на <Picture {top}> пользователя (Фото {top}), '
                          f'подключено доп. фото: {user_refs}')
     scene = _sections(scene_prompt)
     if scene is None:
