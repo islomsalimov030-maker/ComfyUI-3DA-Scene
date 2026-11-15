@@ -69,7 +69,20 @@ def check_file(asset, manifest):
         raise ValueError('3DA: GLB и manifest сцены не совпадают')
 
 
+def untouched(manifest):
+    """0.3.28: 3D-окно ещё не прислало положения объектов (Run сразу после подготовки) —
+    берём авто-постановку как есть: тело без сдвига, предметы на местах из manifest."""
+    body = json.dumps(dict(placement_key=manifest['placement_key'], matrix=np.eye(4).tolist()))
+    props = [{**e['prop'], 'absolute_matrix_world': prop_matrix(np.asarray(e['matrix_world'], dtype=float)).tolist()}
+             for e in manifest['entities'] if e['kind'] == 'prop']
+    if not any(e['kind'] == 'body' for e in manifest['entities']):
+        raise ValueError('3DA: персонаж отсутствует')
+    return body, json.dumps(props)
+
+
 def edits(manifest, models):
+    if isinstance(models, list) and not models:
+        return untouched(manifest)
     if not isinstance(models, list) or len(models) != len(manifest['entities']):
         raise ValueError('3DA: отсутствуют transforms объектов; нужен scene adapter')
     by_id = {item.get('entity_id'): item for item in models}

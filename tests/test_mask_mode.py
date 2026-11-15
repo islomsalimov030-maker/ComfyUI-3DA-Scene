@@ -102,3 +102,15 @@ def test_aio_v331_labels():
     P = prompt_h3
     assert [P.user_label(n) for n in (1, 2, 3, 4, 5)] == ['<Picture 1>', '<Video 1>', '<Picture 3>', '<Picture 4>', '<Picture 5>']
     assert [P.mask_label(n) for n in (1, 2, 3, 5)] == ['<Picture 1>', '<Picture 1>', '<Picture 3>', '<Picture 5>']
+
+
+def test_scene_edit_untouched():
+    import sys, importlib, json as _j
+    import numpy as _np
+    sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1] / 'tools' / 'scene3d'))
+    S = importlib.import_module('scene_edit')
+    m = {'placement_key': 'k', 'entities': [{'id': 'body', 'kind': 'body', 'matrix_world': _np.eye(4).tolist()},
+         {'id': 'prop_0', 'kind': 'prop', 'prop': {'prop_id': 'stick'}, 'matrix_world': (_np.eye(4) * [.5, .5, .5, 1]).tolist()}]}
+    body, props = S.edits(m, [])
+    assert _j.loads(body)['matrix'] == _np.eye(4).tolist()
+    assert _j.loads(props)[0]['absolute_matrix_world'][0][0] == .5
