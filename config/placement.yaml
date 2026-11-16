@@ -294,3 +294,77 @@ place:
   refit_yaw_free_deg: 3.0
   clamped_flag_deg: 0.5
   visibility_depth_m: 0.02
+
+# E1 (0.3.31): узел 3DAPlaceCandidates / tools/scene3d/posev2/candidates.py — кандидаты постановки и их оценка.
+# Старый 3DAPlacePose этот раздел не читает.
+candidates:
+  max_seconds: 900            # общий лимит узла на строку; не уложился — лучший из готовых
+  cli_timeout_s: 300          # лимит одного кандидата (штатный 3DAPlacePose — 600 с)
+  zone_relax_frac: 0.5        # no_target по zone_too_small → повтор: маска опоры ≥ 0.5 × след тела (штатно 1.0)
+  floor_band_m: 0.12          # |высота − пол| ≤ этого — уровень пола (обрывки пола surf_N, коврик)
+  max_cells: 1500             # подвыборка ячеек маски поверхности для расстояний между кусками
+  extent_percentiles: [2, 98] # длина/ширина следа группы по главным осям
+  geometry:                   # геометрические метки авто-поверхностей (высоты — над полом, м)
+    group_dh_m: 0.30          # куски одной мебели: разница высот не больше…
+    group_link_m: 0.12        # …и ячейки ближе этого (кровать, разбитая на корзины высоты 2 см)
+    seat_h: [0.25, 0.68]      # высота сиденья/лежанки над полом (мебель обычного размера)
+    back_dh_m: [0.20, 0.65]   # спинка дивана выше сиденья на столько…
+    back_link_m: 0.90         # …и не дальше этого по горизонтали от сиденья
+    bed_min_l_m: 1.60         # след группы ≥ 1.6 × 1.0 м при высоте сиденья — кровать
+    bed_min_w_m: 1.00
+    small_top_max_area_m2: 0.35   # верх меньше (на высоте сиденья или стола) — тумба; табурет по геометрии не отличить
+    table_h: [0.25, 1.05]     # верх стола/тумбы/массажного стола
+  synonyms:                   # слова для подсказки hint_json.support и для таблицы классов
+    floor: [mat, rug, ground]
+    bed: [mattress]
+    sofa: [couch, seat, armchair, loveseat]
+    bench: [seat, chair, ottoman, massage_table]
+    table: [desk, massage_table, counter]
+    nightstand: [cabinet, dresser, side_table]
+    shelf: []
+    backrest: []              # верх спинки дивана — не опора
+  support_by_class:           # опоры по классу позы в порядке приоритета; deny — не годятся
+    sit_edge: {allowed: [sofa, couch, armchair, chair, bench, bed, stool, ottoman, massage_table],
+               deny: [nightstand, cabinet, dresser, shelf, table, desk, floor]}
+    sit_tucked: {allowed: [sofa, couch, armchair, chair, bench, bed, stool, ottoman, massage_table],
+                 deny: [nightstand, cabinet, dresser, shelf, table, desk, floor]}
+    recline: {allowed: [bed, sofa, couch, bench, massage_table, mat, floor], deny: [nightstand, shelf, stool]}
+    lie: {allowed: [bed, sofa, couch, bench, massage_table, mat, floor], deny: [nightstand, shelf, stool]}
+    kneel: {allowed: [floor, mat], deny: []}
+    crouch: {allowed: [floor, mat], deny: []}
+    sit_floor: {allowed: [floor, mat], deny: []}
+    all_fours: {allowed: [floor, mat], deny: []}
+    stand: {allowed: [floor], deny: []}
+  wall_parts: [back]          # «у стены» (hint near_wall): штатный secondary_contacts <часть>:wall
+  stand_yaws_deg: [25, -25]   # свободно стоя: доп. развороты к референсу (по одному кандидату)
+  flip_flags: [side_flip, side_conflict]   # флаги отчёта → вариант разворота +180 у мебели
+  back_gap_flip_cm: 15.0      # спинка дальше этого — тоже вариант +180
+  typical_sizes:              # типовые высоты (м) для room_scale; только смысловые имена объектов
+    door: [2.00, 2.10]
+    sofa: [0.40, 0.50]
+    couch: [0.40, 0.50]
+    chair: [0.40, 0.50]
+    armchair: [0.40, 0.50]
+    table: [0.72, 0.78]
+    desk: [0.72, 0.78]
+    bed: [0.45, 0.60]
+  scale_from_geometry_labels: false  # геометрические метки выведены из высоты — по ним масштаб не считаем
+  room_scale_tol: 0.15        # |room_scale − 1| больше — room_scale_suspect и кандидат с height_m / room_scale
+  weights:                    # итоговая оценка 0..1 = Σ вес·составляющая / Σ весов
+    status: 0.35
+    gap: 0.10
+    penetration: 0.10
+    pose_match: 0.10
+    support_class: 0.25
+    visibility: 0.10
+  score:
+    status: {ok: 1.0, partial: 0.7, out_of_frame: 0.3, contact_fail: 0.2, wrong_surface: 0.1, no_target: 0.0, fallback: 0.0}
+    gap_scale_cm: 5.0
+    pen_scale_cm: 10.0
+    pose_scale_deg: 45.0
+    ref_error_deg_per_m: 100.0
+    pose_unknown: 0.5
+    support_unknown: 0.5
+    support_tier1: 0.6        # опора годится только по синониму (стол → массажный стол)
+    support_step: 0.05        # минус за каждую позицию в списке класса
+    partly_visible: 0.5

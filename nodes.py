@@ -202,6 +202,12 @@ def error_text(error):
 
 
 def invoke(command, fields, images):
+    return run_cli('tools/scene3d/pack_cli.py', command, fields, images)
+
+
+def run_cli(script_rel, command, fields, images, timeout=600, check=True):
+    """Запуск CLI пакета в отдельном процессе. invoke() — pack_cli с прежними 600 с и ошибкой при status=error.
+    E1: 3DAPlaceCandidates зовёт candidates_cli.py со своим лимитом и check=False (нужен отчёт и при ошибке)."""
     cfg = config()
     root = Path(cfg['farm_root']) / 'pack_requests'
     root.mkdir(parents=True, exist_ok=True)
@@ -222,7 +228,7 @@ def invoke(command, fields, images):
         request[key] = str(path)
     req, out = work / 'request.json', work / 'result.json'
     req.write_text(json.dumps(request, ensure_ascii=False), encoding='utf-8')
-    script = Path(cfg['repo']) / 'tools/scene3d/pack_cli.py'
+    script = Path(cfg['repo']) / script_rel
     if not script.is_file():
         raise FileNotFoundError(f'CLI not installed: {script}')
     t0 = time.monotonic()
@@ -235,7 +241,7 @@ def invoke(command, fields, images):
                             cwd=cfg['repo'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             encoding='utf-8', errors='replace', env=env, **options)
     try:
-        stdout, stderr = proc.communicate(timeout=600)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         # Terminate the complete worker/geometry/Blender tree, not only its root.
         try:
@@ -259,11 +265,11 @@ def invoke(command, fields, images):
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
-        raise RuntimeError('CLI timeout after 600s; process-tree termination requested')
+        raise RuntimeError(f'CLI timeout after {timeout:g}s; process-tree termination requested')
     if proc.returncode:
         raise RuntimeError('\n'.join(stderr.splitlines()[-30:]) or f'CLI exit {proc.returncode}')
     result = json.loads(out.read_text(encoding='utf-8'))
-    if str(result.get('status', '')).startswith('error'):
+    if check and str(result.get('status', '')).startswith('error'):
         raise RuntimeError(result.get('error', result['status']) + '\n' + result.get('stderr_tail', ''))
     result.setdefault('timings', {})['node_total_s'] = round(time.monotonic() - t0, 3)
     return result
@@ -481,6 +487,10 @@ class PlacePose:
     FUNCTION = 'execute'
     CATEGORY = '3DA'
 
+    def runner(self, command, fields, images):
+        # E1: точка подмены для 3DAPlaceCandidates; у самого 3DAPlacePose — прежний invoke.
+        return invoke(command, fields, images)
+
     def execute(self, location, pose_ref, pose_class, target_object, support_parts, secondary_contacts,
                 instance_hint, height_m, body_json, proxy, strength, seed, block_on_fail=False,
                 body_dx=0., body_dy=0., body_dz=0., body_dyaw=0., body_dpitch=0., body_droll=0.,
@@ -501,7 +511,7 @@ class PlacePose:
             finite_number(megapixels, 'megapixels', minimum=0., maximum=4.2)
             validated_props(props)
             options = scene_settings(settings)
-            result = invoke('place', dict(strength_margin=options['strength_margin'],
+            result = self.runner('place', dict(strength_margin=options['strength_margin'],
                             shadow_strength=options['shadow_strength'],
                             render_shadow_opacity=options['render_shadow_opacity'], body_model=options['body_model'],
                             location=location, pose_class=pose_class, target_object=target_object,
@@ -1648,10 +1658,204 @@ class BodyMeasure:
         return {'ui': {'text': [text]}, 'result': (text,)}
 
 
+def candidates_helpers():
+    import importlib.util
+    path = Path(config()['repo']) / 'tools/scene3d/posev2/candidates.py'
+    spec = importlib.util.spec_from_file_location('three_da_candidates', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def contact_sheet(tiles, columns=3, tile_w=448):
+    """E1: playblast кандидатов сеткой с подписью «№, объект, разворот, оценка» (ASCII — шрифт по умолчанию)."""
+    from PIL import ImageDraw
+    if not tiles:
+        return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+    cols = max(1, min(columns, len(tiles)))
+    rows = (len(tiles) + cols - 1) // cols
+    images = []
+    for image, caption in tiles:
+        pixels = np.clip(image[0].detach().cpu().float().numpy() * 255, 0, 255).astype('uint8')
+        im = Image.fromarray(pixels)
+        im = im.resize((tile_w, max(1, round(im.height * tile_w / im.width))))
+        images.append((im, caption))
+    tile_h = max(im.height for im, _ in images) + 22
+    sheet = Image.new('RGB', (cols * tile_w, rows * tile_h), (24, 24, 24))
+    draw = ImageDraw.Draw(sheet)
+    for k, (im, caption) in enumerate(images):
+        x, y = (k % cols) * tile_w, (k // cols) * tile_h
+        sheet.paste(im, (x, y + 22))
+        draw.text((x + 4, y + 5), caption.encode('ascii', 'replace').decode(), fill=(255, 255, 255))
+    return torch.from_numpy(np.asarray(sheet, dtype=np.float32) / 255.)[None]
+
+
+class CandidatePose(PlacePose):
+    """3DAPlacePose для одного кандидата: CLI candidates_cli.py (та же постановка pack_cli) со своим лимитом,
+    доп. полями e1_* и отчётом даже при no_target (self.last)."""
+    def __init__(self, timeout, extra=None):
+        self.timeout, self.extra, self.last = timeout, dict(extra or {}), None
+
+    def runner(self, command, fields, images):
+        self.last = None
+        result = run_cli('tools/scene3d/posev2/candidates_cli.py', command, {**fields, **self.extra}, images,
+                         timeout=self.timeout, check=False)
+        self.last = result
+        if str(result.get('status', '')).startswith('error'):
+            raise RuntimeError(result.get('error', result['status']) + '\n' + result.get('stderr_tail', ''))
+        return result
+
+
+class PlaceCandidates:
+    """E1: несколько вариантов постановки (опора × место × разворот × рост) штатным 3DAPlacePose,
+    оценка каждого по его отчёту и выбор лучшего (или pick). Сам 3DAPlacePose не меняется."""
+    SKIP = ('target_object', 'instance_hint', 'body_dx', 'body_dy', 'body_dz', 'body_dyaw', 'body_dpitch', 'body_droll')
+
+    @classmethod
+    def IS_CHANGED(cls, location=None, props='[]', **kwargs):
+        return PlacePose.IS_CHANGED(location, props, **kwargs)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        base = PlacePose.INPUT_TYPES()
+        required = {k: v for k, v in base['required'].items() if k not in cls.SKIP}
+        required['objects'] = ('STRING', {'forceInput': True, 'tooltip': 'Выход objects узла 3DA Location'})
+        required['n_candidates'] = ('INT', {'default': 4, 'min': 1, 'max': 8})
+        required['pick'] = ('INT', {'default': -1, 'min': -1, 'max': 16,
+                                    'tooltip': '-1 — лучший по оценке; 0 и больше — кандидат с этим номером'})
+        optional = dict(base['optional'])
+        optional['hint_json'] = ('STRING', {'default': '', 'multiline': True,
+                                            'tooltip': '{"support":"sofa","facing":"camera","near_wall":true}; пусто — без подсказки'})
+        return {'required': required, 'optional': optional}
+    RETURN_TYPES = PlacePose.RETURN_TYPES + ('STRING', 'IMAGE')
+    RETURN_NAMES = PlacePose.RETURN_NAMES + ('candidates_json', 'contact_sheet')
+    FUNCTION = 'execute'
+    CATEGORY = '3DA/auto'
+
+    def execute(self, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
+                strength, seed, objects, n_candidates=4, pick=-1, block_on_fail=False, hint_json='', pose_text='',
+                props='[]', body_transform='', megapixels=0., settings=None):
+        try:
+            return self.run(location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json,
+                            proxy, strength, seed, objects, n_candidates, pick, block_on_fail, hint_json, pose_text,
+                            props, body_transform, megapixels, settings)
+        except Exception as exc:
+            out = fallback_outputs('кандидаты: ' + short_reason(exc), error_text(exc))
+            return out + (json.dumps({'error': short_reason(exc), 'candidates': []}, ensure_ascii=False),
+                          torch.zeros((1, 64, 64, 3), dtype=torch.float32))
+
+    def run(self, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
+            strength, seed, objects, n_candidates, pick, block_on_fail, hint_json, pose_text, props, body_transform,
+            megapixels, settings):
+        t0 = time.monotonic()
+        upstream = error_payload(location) or error_payload(body_transform)
+        if upstream is not None:
+            out = fallback_outputs(upstream)
+            return out + (json.dumps({'error': upstream, 'candidates': []}, ensure_ascii=False), out[0])
+        cm = candidates_helpers()
+        cfg = cm.load_config()
+        hint = cm.parse_hint(hint_json)
+        n = max(1, min(int(n_candidates), 8))
+        pc = pose_class
+        if pc == 'auto' and hint.get('pose_class') in CLASSES and hint['pose_class'] != 'auto':
+            pc = hint['pose_class']
+        profile, profile_dir = None, None
+        if isinstance(location, str) and Path(location).is_file():
+            try:
+                profile, profile_dir = json.loads(Path(location).read_text(encoding='utf-8')), Path(location).parent
+            except ValueError:
+                profile = None
+        objs = cm.enrich(cm.parse_objects(objects), profile, profile_dir, cfg)
+        labels = cm.classify(objs, cfg)
+        scale, scale_flags = cm.room_scale(objs, labels, cfg)
+        cands = cm.plan(pc, objs, labels, hint, n, cfg, height_m, secondary_contacts)
+        entries, best, picked, tiles, ran = [], None, None, [], []
+        timeout = float(cfg['cli_timeout_s'])
+
+        def run_one(index, c):
+            pose = CandidatePose(timeout, {'e1_zone_min_frac': c['zone_min_frac']} if c.get('zone_min_frac') else None)
+            outs = pose.execute(location, pose_ref, pc, c['target_object'], support_parts, c['secondary_contacts'],
+                                c['instance_hint'], c['height_m'], body_json, proxy, strength, seed, block_on_fail,
+                                c['body_dx'], c['body_dy'], 0., c['body_dyaw'], 0., 0., pose_text, props,
+                                body_transform, megapixels, settings)
+            st, rep = cm.report_of(outs[5])
+            place_status = rep.get('status') if rep else None
+            if not rep and pose.last and isinstance(pose.last.get('report'), dict):
+                # тела нет (no_target и т. п.): выход — запасной путь, но причину берём из отчёта place()
+                rep, place_status = pose.last['report'], pose.last.get('place_status')
+            value, comp = cm.score(c, st, rep if st != 'fallback' else {}, pc, cfg)
+            entry = {'index': index, **{k: c.get(k) for k in ('variant', 'target_object', 'instance_hint', 'support_id',
+                                                              'label', 'secondary_contacts', 'body_dx', 'body_dy',
+                                                              'body_dyaw', 'height_m', 'zone_min_frac')},
+                     'geometry': labels.get(c['support_id'] or '', {}).get('features'),
+                     'status': st, 'place_status': place_status,
+                     'support_object': cm.actual_support(rep, c, labels, objs) if st != 'fallback' else 'other',
+                     'support_gap_cm': rep.get('support_gap_cm'), 'max_penetration_cm': rep.get('max_penetration_cm'),
+                     'flags': rep.get('flags'), 'zone': (rep.get('zone_diagnostics') or {}) if st == 'fallback' else None,
+                     'error': outs[5].partition('\n')[0][:200] if st == 'fallback' else None,
+                     'score': value, 'components': comp, 'seconds': round(time.monotonic() - started, 1)}
+            caption = f"#{index} {c['support_id'] or c['target_object']} {c['label']} yaw{c['body_dyaw']:+g} {st} {value:.2f}"
+            return outs, rep, entry, caption
+
+        limit = float(cfg['max_seconds'])
+        queue = list(cands)
+        index = 0
+        derived_done = False
+        while queue:
+            if time.monotonic() - t0 > limit:
+                for c in queue:
+                    entries.append({'index': index, 'variant': c['variant'], 'support_id': c['support_id'],
+                                    'label': c['label'], 'status': 'skipped_time', 'score': None})
+                    index += 1
+                break
+            c = queue.pop(0)
+            started = time.monotonic()
+            outs, rep, entry, caption = run_one(index, c)
+            entries.append(entry)
+            ran.append((c, entry, rep))
+            tiles.append((outs[0], caption))
+            # держим выходы только лучшего по оценке и выбранного pick (память: по 10 тензоров на кандидата)
+            if best is None or entry['score'] > best[0]['score']:
+                best = (entry, outs, rep)
+            if pick == index:
+                picked = (entry, outs, rep)
+            index += 1
+            # no_target по zone_too_small — сразу тот же вариант с мягкой зоной (место того же кандидата)
+            queue[:0] = cm.retries(c, entry['place_status'], entry['flags'], cfg)
+            if not queue and not derived_done:
+                derived_done = True
+                first_run = [(c0, r0) for c0, e0, r0 in ran if c0.get('origin') is None]
+                top = max(range(len(ran)), key=lambda k: (ran[k][1]['score'], -k))
+                queue = cm.derived([c0 for c0, _ in first_run], [{'report': r0} for _, r0 in first_run], cfg, n,
+                                   scale_flags, scale, best_cand=ran[top][0])
+        if best is None:
+            raise RuntimeError('ни один кандидат не выполнен')
+        entry, outs, rep = picked if picked is not None else best
+        first, _, _ = outs[5].partition('\n')
+        notes = [f"кандидат {entry['index']}/{len(entries)} ({entry['support_object']}, {entry['variant']}), "
+                 f"оценка {entry['score']:.2f}"]
+        flags = list(scale_flags)
+        if flags:
+            notes.append('масштаб комнаты: ' + ', '.join(flags))
+        if any(e['status'] == 'skipped_time' for e in entries):
+            notes.append(f"лимит {limit:.0f} с: часть кандидатов не выполнена")
+        status = first + ' | ' + '; '.join(notes) + '\n' + json.dumps({
+            'status': entry['status'], 'support_object': entry['support_object'],
+            'support_gap_cm': entry['support_gap_cm'], 'max_penetration_cm': entry['max_penetration_cm'],
+            'candidate_index': entry['index'], 'score': entry['score'], 'pose_class': pc, 'flags': flags,
+            'room_scale': scale, 'report': rep}, ensure_ascii=False)
+        summary = {'pose_class': pc, 'hint': hint, 'room_scale': scale, 'room_flags': flags,
+                   'chosen': entry['index'], 'pick': pick, 'seconds': round(time.monotonic() - t0, 1),
+                   'labels': {k: {'label': v['label'], **(v.get('features') or {})} for k, v in labels.items()},
+                   'candidates': entries}
+        return outs[:5] + (status,) + outs[6:] + (json.dumps(summary, ensure_ascii=False, default=str),
+                                                  contact_sheet(tiles))
+
+
 NODE_CLASS_MAPPINGS = {'3DAControl': Control, '3DABodyProfile': BodyProfile, '3DABodyMeasure': BodyMeasure, '3DALocation': Location, '3DAPlacePose': PlacePose, '3DAProp': Prop, '3DAH3Remote': H3Remote,
                        '3DANativeGuides': NativeGuides, '3DANativeComposite': NativeComposite,
                        '3DASceneEdits': SceneEdits, '3DASceneExport': SceneExport, '3DACoreWeights': CoreWeights,
-                       '3DABlenderRuntime': BlenderRuntime}
+                       '3DABlenderRuntime': BlenderRuntime, '3DAPlaceCandidates': PlaceCandidates}
 NODE_DISPLAY_NAME_MAPPINGS = {'3DAControl': '3DA · 3D-контроль (пульт)', '3DABodyProfile': '3DA · Персонаж: телосложение', '3DABodyMeasure': '3DA · Персонаж: мерки', '3DALocation': '3DA Location', '3DAPlacePose': '3DA Place Pose',
                               '3DAProp': '3DA Prop', '3DAH3Remote': '3DA H3 Remote',
                               '3DANativeGuides': '3DA · native H3 guides + gate',
@@ -1659,4 +1863,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {'3DAControl': '3DA · 3D-контроль (пул�
                               '3DASceneEdits': '3DA · правки выбранных объектов',
                               '3DASceneExport': '3DA · подготовить 3D-сцену для гизмо',
                               '3DACoreWeights': '3DA Core Weights (MoGe-2, SAM 3D Body)',
-                              '3DABlenderRuntime': '3DA Blender Runtime (bpy libs)'}
+                              '3DABlenderRuntime': '3DA Blender Runtime (bpy libs)',
+                              '3DAPlaceCandidates': '3DA · постановка: кандидаты'}
