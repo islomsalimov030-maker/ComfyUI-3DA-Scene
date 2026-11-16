@@ -9,7 +9,7 @@ import subprocess
 
 import numpy as np
 
-from prop_gizmo import model_matrix, validate_matrix, camera_config
+from prop_gizmo import B, model_matrix, validate_matrix, camera_config
 
 
 def rigid_matrix(value):
@@ -80,6 +80,31 @@ def untouched(manifest):
     return body, json.dumps(props)
 
 
+POSE_HANDLES = ('hand_l', 'hand_r', 'foot_l', 'foot_r', 'chest')   # = posev2/pose_ik.HANDLES
+
+
+def pose_edits(value):
+    """E10: сдвиги ручек манекена из 3D-окна (оси three.js, Y вверх) -> мировые оси постановки (Z вверх), м.
+    Нулевые сдвиги отбрасываются; полная проверка (предел сдвига) — в pose_ik.parse при постановке."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('3DA: pose_edits должен быть словарём {ручка: [dx, dy, dz]}')
+    out = {}
+    for key, raw in value.items():
+        if key not in POSE_HANDLES:
+            raise ValueError(f'3DA: неизвестная ручка позы {key!r}')
+        try:
+            vec = np.asarray(raw, dtype=float)
+        except (TypeError, ValueError):
+            raise ValueError(f'3DA: ручка {key}: нужен сдвиг [dx, dy, dz]') from None
+        if vec.shape != (3,) or not np.isfinite(vec).all():
+            raise ValueError(f'3DA: ручка {key}: нужен сдвиг [dx, dy, dz]')
+        if np.any(vec != 0):
+            out[key] = [round(float(x), 6) for x in B.T @ vec]
+    return out
+
+
 def edits(manifest, models):
     if isinstance(models, list) and not models:
         return untouched(manifest)
@@ -93,7 +118,12 @@ def edits(manifest, models):
         matrix = validate_matrix(model_matrix([by_id[entity['id']]]))
         if entity['kind'] == 'body':
             delta = body_matrix(matrix @ np.linalg.inv(np.asarray(entity['matrix_world'])))
-            body = json.dumps(dict(placement_key=manifest['placement_key'], matrix=delta.tolist()))
+            data = dict(placement_key=manifest['placement_key'], matrix=delta.tolist())
+            # E10: ручки манекена — новый необязательный ключ; без правок строка как раньше.
+            edits_body = pose_edits(by_id[entity['id']].get('pose_edits'))
+            if edits_body:
+                data['pose_edits'] = edits_body
+            body = json.dumps(data)
         elif entity['kind'] == 'prop':
             props.append({**entity['prop'], 'absolute_matrix_world': prop_matrix(matrix).tolist()})
         else:
@@ -153,6 +183,24 @@ def export(setup, cfg):
     if not room_path.exists():
         copy2(room_source, room_path)
     raster = [1344, 768]
-    return dict(model_file=model_file, manifest=str(manifest_path), entities=manifest['entities'],
+    entities = [pose_rig(e, setup, cfg) if e['kind'] == 'body' else e for e in manifest['entities']]
+    return dict(model_file=model_file, manifest=str(manifest_path), entities=entities,
                 camera=camera_config(plate,raster), raster=raster, background=background_name,
                 room_mesh='3d/3da_scene/'+room_name)
+
+
+def pose_rig(entity, setup, cfg):
+    """E10: скелет для ручек 3D-окна — 70 точек MHR70 постановки в локальных осях тела GLB (three.js, Y вверх)
+    и пороги IK (config/pose_edits.yaml). Нет точек — тело без ручек (как до E10)."""
+    try:
+        import yaml
+        with np.load(setup['joints'], allow_pickle=False) as d:
+            kp = np.asarray(d['kp'], dtype=float)
+        if kp.shape != (70, 3) or not np.isfinite(kp).all():
+            return entity
+        world = np.linalg.inv(np.asarray(entity['matrix_world'], dtype=float))
+        local = (kp @ world[:3, :3].T + world[:3, 3]) @ B.T
+        conf = yaml.safe_load((Path(cfg['repo']) / 'config/pose_edits.yaml').read_text(encoding='utf-8'))
+    except Exception:
+        return entity
+    return {**entity, 'pose_rig': dict(kp_local=np.round(local, 6).tolist(), config=conf)}

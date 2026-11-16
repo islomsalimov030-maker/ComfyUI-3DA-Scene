@@ -1,5 +1,6 @@
 // Named-object selection on the existing core gizmo, not another 3D editor.
 import { parseObj, cameraModel, buildRoom, diagnose as roomDiagnose, occluderGeometry, worldVertices, bringToBody, centerOnAxis, centerOnFloor, padStep } from './roomGeometry.js';
+import { poseHandles } from './poseHandles.js';
 export function sceneSelection(view, node, initialTransforms = null) {
   const setup = node.properties['3DA Scene'];
   if (!setup?.entities?.length) return null;
@@ -18,14 +19,23 @@ export function sceneSelection(view, node, initialTransforms = null) {
     e.object.quaternion.set(t.quaternion.x, t.quaternion.y, t.quaternion.z, t.quaternion.w);
     e.object.scale.set(t.scale.x, t.scale.y, t.scale.z);
   }
+  root.updateMatrixWorld(true);
+  // E10: ручки позы манекена (кисти, стопы, грудь) — только у тела, только если экспорт дал скелет.
+  const bodyEntity = entities.find(e => e.kind === 'body');
+  let pose = null;
+  try { pose = bodyEntity ? poseHandles(view, bodyEntity, node, () => refresh()) : null; }
+  catch (e) { console.error('3DA pose handles:', e); }
   function capture() {
     root.updateMatrixWorld(true);
     return entities.map(e => {
       const p = e.object.getWorldPosition(e.object.position.clone());
       const q = e.object.getWorldQuaternion(e.object.quaternion.clone());
       const s = e.object.getWorldScale(e.object.scale.clone());
-      return { entity_id: e.id, position: { x:p.x,y:p.y,z:p.z },
+      const item = { entity_id: e.id, position: { x:p.x,y:p.y,z:p.z },
         quaternion: { x:q.x,y:q.y,z:q.z,w:q.w }, scale: { x:s.x,y:s.y,z:s.z } };
+      // E10: без правок ручек ключа нет — строка body_transform как раньше.
+      if (e.kind === 'body' && pose?.hasEdits()) item.pose_edits = pose.worldDeltas();
+      return item;
     });
   }
   let selected;
@@ -40,6 +50,12 @@ export function sceneSelection(view, node, initialTransforms = null) {
   picker.className = 'threeda-entity-selector';
   Object.assign(picker.style, { color:'white', background:'#263744', padding:'5px', maxWidth:'240px' });
   for (const e of entities) picker.add(new Option(e.label, e.id));
+  if (pose) {
+    const group = document.createElement('optgroup');
+    group.label = 'Ручки позы манекена';
+    for (const h of pose.handles) group.appendChild(new Option('◉ ' + pose.labels[h], 'h:' + h));
+    picker.appendChild(group);
+  }
   const modes = document.createElement('select');
   modes.className = 'threeda-mode-selector';
   modes.setAttribute('aria-label', 'Режим гизмо 3DA');
@@ -58,12 +74,25 @@ export function sceneSelection(view, node, initialTransforms = null) {
   toFrame.textContent = 'В кадр';
   toFrame.title = 'Предмет — перед персонажем; персонаж — в центр кадра (дальше двигайте гизмо)';
   Object.assign(toFrame.style, { color:'white', background:'#263744', padding:'5px 8px', border:'1px solid #4b6070', cursor:'pointer' });
-  toolbar.append(picker,modes,toFrame,status);
+  // E10: сброс правок ручек — выбранной или всех.
+  const resetHandle = document.createElement('button');
+  resetHandle.className = 'threeda-reset-handle';
+  resetHandle.textContent = 'Сбросить ручку';
+  resetHandle.title = 'Вернуть выбранную ручку (кисть, стопа, грудь) в исходную позу';
+  const resetPose = document.createElement('button');
+  resetPose.className = 'threeda-reset-pose';
+  resetPose.textContent = 'Сбросить позу';
+  resetPose.title = 'Вернуть все ручки: поза — как после постановки';
+  for (const b of [resetHandle, resetPose])
+    Object.assign(b.style, { color:'white', background:'#263744', padding:'5px 8px', border:'1px solid #4b6070', cursor:'pointer' });
+  toolbar.append(picker,modes,toFrame,...(pose ? [resetHandle, resetPose] : []),status);
   const parent = view.domElement.parentElement;
   parent?.appendChild(toolbar);
   for (const event of ['pointerdown','pointerup','click','dblclick','keydown'])
     toolbar.addEventListener(event, e => e.stopPropagation());
   picker.addEventListener('change', () => select(picker.value));
+  resetHandle.addEventListener('click', () => { if (selected?.kind === 'handle') pose?.reset(selected.handle); });
+  resetPose.addEventListener('click', () => pose?.reset(null));
   toFrame.addEventListener('click', () => {
     const body = entities.find(e => e.kind === 'body');
     if (!selected || !body) return;
@@ -124,7 +153,16 @@ export function sceneSelection(view, node, initialTransforms = null) {
   controls?.addEventListener('mouseUp', endScale);
   controls?.addEventListener('objectChange', refresh);
   controls?.addEventListener('mouseUp', refresh);
+  // E10: двинули ручку — IK и деформация; двинули тело — ручки едут с ним.
+  const poseChange = () => {
+    if (selected?.kind === 'handle') pose?.moved(selected.handle);
+    else pose?.sync();
+  };
+  controls?.addEventListener('objectChange', poseChange);
   function syncMode() {
+    // Ручку только перемещают: вращение/масштаб к ней не применяются.
+    if (selected?.kind === 'handle' && gizmo.getMode() !== 'translate') view.setGizmoMode('translate');
+    pose?.sync();
     const mode = gizmo.getMode();
     if (mode !== lastMode) {
       modes.value = mode;
@@ -136,11 +174,30 @@ export function sceneSelection(view, node, initialTransforms = null) {
   }
   function setMode(mode) {
     if (!['translate','rotate','scale'].includes(mode)) return;
+    if (selected?.kind === 'handle') mode = 'translate';
     view.setGizmoMode(mode);
     syncMode();
   }
   modes.addEventListener('change', () => setMode(modes.value));
   function select(id) {
+    if (pose && typeof id === 'string' && id.startsWith('h:') && pose.sphere(id.slice(2))) {
+      const h = id.slice(2);
+      view.getGizmoManager().setupForModel(pose.sphere(h));
+      view.setGizmoEnabled(true);
+      selected = { id, kind: 'handle', handle: h, object: pose.sphere(h), label: pose.labels[h] };
+      picker.value = id;
+      toFrame.disabled = true;
+      toFrame.style.opacity = '0.4';
+      resetHandle.disabled = false; resetHandle.style.opacity = '1';
+      node.properties['3DA Selected Entity'] = id;
+      pose.highlight(h);
+      view.setGizmoMode('translate');
+      syncMode();
+      view.forceRender();
+      return;
+    }
+    pose?.highlight(null);
+    resetHandle.disabled = true; resetHandle.style.opacity = '0.4';
     const entity = entities.find(e => e.id === id);
     if (!entity) throw new Error('3DA: неизвестный объект');
     // setupForModel changes only the active TransformControls target.
@@ -155,18 +212,23 @@ export function sceneSelection(view, node, initialTransforms = null) {
     view.forceRender();
   }
   const pad = remotePad(view, setup, () => selected, () => gizmo.getMode(), () => {
-    root.updateMatrixWorld(true); view.forceRender(); refresh(); });
+    root.updateMatrixWorld(true); poseChange(); view.forceRender(); refresh(); });
   const savedSelection = node.properties['3DA Selected Entity'];
-  select(entities.some(e => e.id === savedSelection) ? savedSelection : entities[0].id);
+  const known = entities.some(e => e.id === savedSelection) ||
+    (pose && typeof savedSelection === 'string' && savedSelection.startsWith('h:') && pose.sphere(savedSelection.slice(2)));
+  select(known ? savedSelection : entities[0].id);
   setMode(initialMode);
   diagnose();
   return { root, entities, capture, select, setMode, syncMode, selected: () => selected.id,
+    setHandlesVisible: v => pose?.setVisible(v),
     dispose: () => {
       controls?.removeEventListener('mouseDown', beginScale);
       controls?.removeEventListener('objectChange', uniformScale);
       controls?.removeEventListener('mouseUp', endScale);
       controls?.removeEventListener('objectChange', refresh);
       controls?.removeEventListener('mouseUp', refresh);
+      controls?.removeEventListener('objectChange', poseChange);
+      pose?.dispose();
       disposed = true;
       occluder?.dispose();
       pad.dispose();

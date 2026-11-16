@@ -126,6 +126,7 @@ function applySceneSetup(message, graph) {
   viewport.properties['3DA Scene'] = setup;
   viewport.properties['3DA Camera Lock'] = { state: setup.camera };
   delete viewport.properties['3DA Scene Transforms'];
+  delete viewport.properties['3DA Pose Edits'];          // E10: новая сцена — ручки позы с нуля
   viewport.properties['3DA Selected Entity'] = 'body';
   viewport.properties['Camera Config'] = { cameraType:'perspective', fov:setup.camera.fov, state:setup.camera, useCustomUp:true, hasCustomUp:true };
   viewport.properties['Scene Config'] = { showGrid:false, backgroundImage:setup.background, backgroundRenderMode:'tiled' };
@@ -196,7 +197,11 @@ async function tick() {
         record.originalSerialize = widget.serializeValue;
         record.serialize = async function (...args) {
           record.lock.restore();
-          const result = await record.originalSerialize.apply(this, args);
+          // E10: сферы-ручки позы не попадают в снимки 3D-окна.
+          record.scene?.setHandlesVisible?.(false);
+          let result;
+          try { result = await record.originalSerialize.apply(this, args); }
+          finally { record.scene?.setHandlesVisible?.(true); }
           if (node.properties['3DA Scene']) {
             // 0.3.2: never throw here — a throw blocks Export and Run («reading 'workflow'»).
             // Scene not loaded yet: keep the last captured transforms (or none → 3DA falls back, no error).

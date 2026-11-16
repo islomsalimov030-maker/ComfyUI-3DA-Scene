@@ -772,10 +772,19 @@ def do_place(request, config):
         if base is None:
             raise ValueError(f"placement has no body geometry (status={result['status']})")
     values = {k: request.get(k, 0.) for k in ("body_dx", "body_dy", "body_dz", "body_dyaw", "body_dpitch", "body_droll")}
+    pose_edits, pose_report = {}, None
     if request.get('body_transform'):
         from scene_edit import body_delta
         values['body_matrix'] = body_delta(request['body_transform'], key)
+        # E10: ручки 3D-окна (кисти, стопы, грудь). Нет ключа pose_edits — путь ровно прежний.
+        import pose_ik
+        pose_edits = pose_ik.edits_from(request['body_transform'])
     moved = 'body_matrix' in values or any(float(v) != 0 for v in values.values())
+    if pose_edits:
+        # IK и LBS — на закэшированном теле до сдвига; дальше тот же revalidate (контакт, проникновение, кадр).
+        base, pose_report = pose_ik.edit_base(base, ref["F"], pose_edits,
+                                              lambda X, KP: manual_pose.transform(X, KP, plate, values)[:2])
+        moved = True
     if moved:
         if pc == 'auto':
             import reference_place
@@ -784,6 +793,8 @@ def do_place(request, config):
             X, KP, fit = manual_pose.revalidate(base, ref, plate, profile, spec, seed, height, values)
     else:
         X, KP, fit = base["X"], base["KP"], base["report"]
+    if pose_report is not None:
+        fit['pose_edits'] = pose_report
     # Advisory frame coverage of the projected 3D bbox, not fraction of vertices.
     import itertools
     import prop_render
