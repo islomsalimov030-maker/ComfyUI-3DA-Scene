@@ -117,7 +117,8 @@ export function twoBone(a, b, c, target, poleHint, eps) {
   const R1 = mm(frame(mul(sub(b2, a), 1 / l1), normal2), tr(frame(mul(sub(b, a), 1 / l1), normal)));
   const R2 = mm(frame(mul(sub(c2, b2), 1 / l2), normal2), tr(frame(mul(sub(c, b), 1 / l2), normal)));
   return { b2, c2, R1, R2, info: { reached: dist >= dmin && dist <= dmax, straightened: dist > dmax,
-    error_m: norm(sub(c2, target)) } };
+    error_m: norm(sub(c2, target)), lengths_m: [l1, l2], bend_deg: Math.acos(Math.max(-1, Math.min(1,
+      dot(sub(a, b2), sub(c2, b2)) / (l1 * l2)))) * 180 / Math.PI } };
 }
 
 // Изгиб корпуса поровну в 3 позвонках вокруг одной оси, таз на месте, угол не больше spine_max_deg.

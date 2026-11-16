@@ -93,9 +93,7 @@ export function poseHandles(view, body, node, changed) {
     node.properties[KEY] = JSON.parse(JSON.stringify(offsets));
     sync();
   }
-  function local(h) {
-    return offsets[h] ? rest[h].map((x, i) => x + offsets[h][i]) : posed[h];
-  }
+  function local(h) { return posed[h]; }
   function sync() {
     body.object.updateMatrixWorld(true);
     for (const h of HANDLES) {
@@ -113,10 +111,16 @@ export function poseHandles(view, body, node, changed) {
   function moved(h) {
     body.object.updateMatrixWorld(true);
     const p = body.object.worldToLocal(spheres[h].position.clone());
-    let d = [p.x - rest[h][0], p.y - rest[h][1], p.z - rest[h][2]];
+    const target = [p.x, p.y, p.z];
+    // После предыдущей ручки мир уже деформирован: измеряем новый сдвиг относительно текущего
+    // положения IK, не сбрасывая остальные ручки на исходную позу.
+    const { T } = solve(K, offsets, conf);
+    const current = posedHandles(K, T)[h];
+    let d = [target[0] - current[0], target[1] - current[1], target[2] - current[2]];
     const n = Math.hypot(...d), limit = conf.max_offset_m * 0.99;
     if (n > limit) d = d.map(x => x * limit / n);
-    if (n > 1e-6) offsets[h] = d; else delete offsets[h];
+    const combined = (offsets[h] ?? [0, 0, 0]).map((x, i) => x + d[i]);
+    if (Math.hypot(...combined) > 1e-6) offsets[h] = combined; else delete offsets[h];
     schedule();
   }
   // Для body_transform: сдвиг ручки в мировых осях 3D-окна (с учётом поворота/масштаба тела).
