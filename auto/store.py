@@ -27,21 +27,53 @@ def root(kind):
     return _roots[kind]
 
 
-def resolve(value):
+def inside(path, base):
+    """Лежит ли path внутри base (после разрешения ссылок и `..`)."""
+    path, base = Path(path).resolve(), Path(base).resolve()
+    return path == base or base in path.parents
+
+
+def check_dirs(name, folder, out_dir, allow_path=False):
+    """Проверить папки пакета: выход — только `output/auto/<имя>`, вход — внутри `input/auto`
+    (абсолютная папка вне его — только при allow_path, т. е. из узла). → (имя, вход, выход)."""
+    name = batch_mod.safe_name(name)
+    expected = root('output') / name
+    if Path(out_dir).resolve() != expected.resolve():
+        raise ValueError(f'папка выхода пакета должна быть {expected}')
+    folder = Path(folder)
+    if not inside(folder, root('input')) and not (allow_path and folder.is_absolute()):
+        raise ValueError('папка пакета вне input/auto')
+    return name, folder, expected
+
+
+def resolve_name(value):
+    """Только имя пакета (для маршрутов сервера): без JSON и путей. → (имя, вход, выход)."""
+    value = str(value or '').strip()
+    if not value:
+        raise ValueError('не указан пакет')
+    name = batch_mod.safe_name(value)
+    if name != value:
+        raise ValueError(f'недопустимое имя пакета: «{value}»')
+    return name, root('input') / name, root('output') / name
+
+
+def resolve(value, allow_path=True):
     """Значение виджета/выхода `batch` → (имя, папка входа, папка выхода).
-    Принимает имя пакета, JSON с выхода «пакет: загрузка» или абсолютный путь к папке."""
+    Принимает имя пакета, JSON с выхода «пакет: загрузка» или (allow_path) абсолютный путь к папке.
+    Выход всегда `output/auto/<имя>`."""
     value = str(value or '').strip()
     if value.startswith('{'):
         data = json.loads(value)
-        return data['name'], Path(data['dir']), Path(data['out_dir'])
+        return check_dirs(data['name'], data['dir'], data['out_dir'], allow_path)
     if not value:
         raise ValueError('пакет не выбран — нажмите «Выбрать папку» или впишите имя пакета')
     if os.path.isabs(value):
+        if not allow_path:
+            raise ValueError('путь к папке здесь не принимается — только имя пакета')
         folder = Path(value)
         name = batch_mod.safe_name(folder.name)
     else:
-        name = batch_mod.safe_name(value)
-        folder = root('input') / name
+        return resolve_name(value)
     return name, folder, root('output') / name
 
 
@@ -143,11 +175,12 @@ def build_report(value):
 
 
 def zip_path(value, rebuild_if_stale=True):
-    """ZIP пакета; собирается заново, если его нет или состояние новее архива."""
-    name, folder, out_dir = resolve(value)
+    """ZIP пакета; собирается заново, если его нет или состояние новее архива.
+    value — значение для resolve() или готовый кортеж (имя, вход, выход)."""
+    name, folder, out_dir = value if isinstance(value, tuple) else resolve(value)
     path = out_dir / f'{name}.zip'
     state_file = out_dir / state_mod.STATE_FILE
     if rebuild_if_stale and (not path.is_file() or not state_file.is_file()
                              or state_file.stat().st_mtime > path.stat().st_mtime):
-        build_report(value)
+        build(name, folder, out_dir)
     return path

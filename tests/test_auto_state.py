@@ -87,8 +87,10 @@ def test_mark_rejects_unknown(roots):
 
 def test_resolve_variants(roots):
     assert store.resolve('pack')[1] == roots / 'input' / 'auto' / 'pack'
-    data = json.dumps({'name': 'pack', 'dir': 'X', 'out_dir': 'Y'})
-    assert store.resolve(data) == ('pack', Path('X'), Path('Y'))
+    data = json.dumps({'name': 'pack', 'dir': str(roots / 'input/auto/pack'), 'out_dir': str(roots / 'output/auto/pack')})
+    assert store.resolve(data) == ('pack', roots / 'input/auto/pack', roots / 'output/auto/pack')
+    with pytest.raises(ValueError):
+        store.resolve(json.dumps({'name': 'pack', 'dir': 'X', 'out_dir': 'Y'}))
     assert store.resolve(str(FIXTURE))[1] == FIXTURE
     for bad in ('', '../pack', 'a/b'):
         with pytest.raises(ValueError):
@@ -154,6 +156,39 @@ def test_upload_route(roots, monkeypatch):
             assert r.status == 200 and (await r.read())[:2] == b'PK'
             r = await client.get('/3da/auto/state', params={'batch': '../x'})
             assert r.status == 400
+            # чужие папки: JSON с dir/out_dir вне input/output и абсолютный путь — только 400
+            outside = roots / 'outside'
+            (outside / 'pk').mkdir(parents=True)
+            (outside / 'pk' / 'secret.txt').write_text('x', encoding='utf-8')
+            evil = json.dumps({'name': 'pk', 'dir': str(outside / 'pk'), 'out_dir': str(outside)})
+            evil_in = json.dumps({'name': 'up_20261117_1030', 'dir': str(roots / 'input/auto/up_20261117_1030'),
+                                  'out_dir': str(outside)})
+            for value in (evil, evil_in, str(outside / 'pk'), str(roots / 'input/auto/up_20261117_1030')):
+                for route in ('/3da/auto/state', '/3da/auto/zip'):
+                    r = await client.get(route, params={'batch': value})
+                    assert r.status == 400, (route, value)
     asyncio.run(run())
     assert not (roots / 'input' / 'evil.png').exists() and not (roots / 'input' / 'auto' / 'evil.png').exists()
     assert (roots / 'input/auto/up_20261117_1030/poses/pose2.png').is_file()
+    assert sorted(p.relative_to(roots / 'outside').as_posix() for p in (roots / 'outside').rglob('*')) == ['pk', 'pk/secret.txt']
+
+
+def test_resolve_confines_dirs(roots, tmp_path):
+    """JSON из узла: выход только output/auto/<имя>, вход внутри input/auto (или явная папка — только из узла)."""
+    other = tmp_path / 'other'
+    other.mkdir()
+    good = store.resolve(json.dumps({'name': 'pk', 'dir': str(roots / 'input/auto/pk'), 'out_dir': str(roots / 'output/auto/pk')}))
+    assert good[2] == roots / 'output/auto/pk'
+    for out in (other, roots / 'output/auto', roots / 'output/auto/pk/..'):
+        with pytest.raises(ValueError):
+            store.resolve(json.dumps({'name': 'pk', 'dir': str(roots / 'input/auto/pk'), 'out_dir': str(out)}))
+    with pytest.raises(ValueError):
+        store.resolve(json.dumps({'name': '../pk', 'dir': str(roots / 'input/auto/pk'), 'out_dir': str(roots / 'output/auto/pk')}))
+    with pytest.raises(ValueError):
+        store.resolve(json.dumps({'name': 'pk', 'dir': str(other), 'out_dir': str(roots / 'output/auto/pk')}), allow_path=False)
+    with pytest.raises(ValueError):
+        store.resolve(str(other), allow_path=False)
+    for bad in ('', '../x', 'a/b', str(other), '{"name": "pk"}'):
+        with pytest.raises(ValueError):
+            store.resolve_name(bad)
+    assert not list(other.iterdir())

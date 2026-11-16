@@ -52,6 +52,8 @@ def batch_data(value):
         data = json.loads(value)
         if 'name' not in data:
             raise ValueError(data.get('error') or 'пакет не загружен')
+        name, folder, out_dir = store.check_dirs(data['name'], data['dir'], data['out_dir'], allow_path=True)
+        data = dict(data, name=name, dir=str(folder), out_dir=str(out_dir))
         st = state_mod.load(data['out_dir'])
         if st is None:
             raise ValueError('состояние пакета не найдено — перезапустите узел «пакет: загрузка»')
@@ -65,7 +67,7 @@ class AutoBatch:
     @classmethod
     def INPUT_TYPES(cls):
         return {'required': {
-            'batch': ('STRING', {'default': '', 'tooltip': 'Имя пакета в input/auto (ставит кнопка «Выбрать папку») или абсолютный путь к папке'}),
+            'batch': ('STRING', {'default': '', 'tooltip': 'Имя пакета в input/auto (ставит кнопка «Выбрать папку») или абсолютный путь к папке (кнопки «Запустить пакет» и «Скачать ZIP» работают только с именем пакета)'}),
             'phases': ('STRING', {'default': '1,2,3,4,5', 'tooltip': 'Фазы для кнопки «Запустить пакет», через запятую'})}}
     RETURN_TYPES = ('STRING', 'INT', 'STRING')
     RETURN_NAMES = ('batch', 'rows_count', 'summary')

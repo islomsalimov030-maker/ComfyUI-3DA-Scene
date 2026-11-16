@@ -2,8 +2,8 @@
 
 POST upload       multipart: `batch`, затем пары `path` + файл (или файл с относительным именем) → input/auto/<пакет>/
 GET  batches      список пакетов
-GET  state?batch= состояние пакета (разбор папки и сведение state.json)
-GET  zip?batch=   ZIP пакета (собирается, если устарел)
+GET  state?batch= (только имя пакета) состояние пакета (разбор папки и сведение state.json)
+GET  zip?batch=   (только имя пакета) ZIP пакета (собирается, если устарел)
 """
 import asyncio
 from urllib.parse import quote
@@ -65,7 +65,7 @@ async def batches(request):
 
 
 def state_json(value):
-    name, parsed, state, out_dir = store.open_batch(value)
+    name, parsed, state, out_dir = store.open_dirs(*store.resolve_name(value))
     return {'batch': name, 'rows_count': len(parsed['rows']), 'statuses': list(STATUSES),
             'rows': [dict(state['rows'][rid], row_id=rid) for rid in state['order']],
             'errors': parsed['errors'], 'updated': state.get('updated')}
@@ -81,7 +81,7 @@ async def state(request):
 async def zip_file(request):
     try:
         value = request.query.get('batch', '')
-        path = await asyncio.to_thread(store.zip_path, value)
+        path = await asyncio.to_thread(store.zip_path, store.resolve_name(value))
     except (ValueError, KeyError) as exc:
         return error(exc)
     if not path.is_file():
