@@ -400,3 +400,18 @@ candidates:
     support_tier2: 0.4        # запасная опора fallback_only (маленькое «сиденье»)
     support_step: 0.05        # минус за каждую позицию в списке класса
     partly_visible: 0.5
+
+# E2 (0.3.36): паспорт локации — узел 3DALocationPassport / tools/scene3d/posev2/passport.py; вход passport у
+# 3DAPlaceCandidates. Старые узлы этот раздел не читают.
+passport:
+  hull_max_points: 32         # контур опорной плоскости в паспорте — выпуклая оболочка, не больше стольких вершин
+  kinds:                      # тип объекта -> вид опорной плоскости (seat вне candidates.geometry.seat_h -> top)
+    floor: floor
+    bed: bed
+    sofa: seat
+    bench: seat
+    seat: seat
+    table: top
+    nightstand: top
+    shelf: top
+  defer_baseline: true        # с паспортом запасной «пол» для сидя ставится, только если мебель не дала тела

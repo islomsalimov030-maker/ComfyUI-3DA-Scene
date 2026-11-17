@@ -1729,6 +1729,9 @@ class PlaceCandidates:
         optional['variant_set'] = ('INT', {'default': 0, 'min': 0, 'max': 2,
                                            'tooltip': '0 — как сейчас; 1 — другие развороты; 2 — соседние опоры и места '
                                                       '(повтор, когда зрение забраковало все кандидаты)'})
+        # E2: только гнездо (forceInput) в конце — у старых графов не сдвигаются значения виджетов
+        optional['passport'] = ('STRING', {'forceInput': True,
+                                           'tooltip': 'Выход passport узла «3DA · паспорт локации»; нет — опоры считаются как раньше'})
         return {'required': required, 'optional': optional}
     RETURN_TYPES = PlacePose.RETURN_TYPES + ('STRING', 'IMAGE')
     RETURN_NAMES = PlacePose.RETURN_NAMES + ('candidates_json', 'contact_sheet')
@@ -1737,11 +1740,11 @@ class PlaceCandidates:
 
     def execute(self, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
                 strength, seed, objects, n_candidates=4, pick=-1, block_on_fail=False, hint_json='', pose_text='',
-                props='[]', body_transform='', megapixels=0., settings=None, variant_set=0):
+                props='[]', body_transform='', megapixels=0., settings=None, variant_set=0, passport=''):
         try:
             return self.run(location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json,
                             proxy, strength, seed, objects, n_candidates, pick, block_on_fail, hint_json, pose_text,
-                            props, body_transform, megapixels, settings, variant_set)
+                            props, body_transform, megapixels, settings, variant_set, passport)
         except Exception as exc:
             out = fallback_outputs('кандидаты: ' + short_reason(exc), error_text(exc))
             return out + (json.dumps({'error': short_reason(exc), 'candidates': []}, ensure_ascii=False),
@@ -1749,7 +1752,7 @@ class PlaceCandidates:
 
     def run(self, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
             strength, seed, objects, n_candidates, pick, block_on_fail, hint_json, pose_text, props, body_transform,
-            megapixels, settings, variant_set=0):
+            megapixels, settings, variant_set=0, passport=''):
         t0 = time.monotonic()
         upstream = error_payload(location) or error_payload(body_transform)
         if upstream is not None:
@@ -1762,7 +1765,7 @@ class PlaceCandidates:
         try:
             cache = self.cache_for(cfg, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m,
                                    body_json, proxy, strength, seed, objects, n_candidates, block_on_fail, hint_json,
-                                   pose_text, props, body_transform, megapixels, settings, variant_set)
+                                   pose_text, props, body_transform, megapixels, settings, variant_set, passport)
             stored = cache.summary() if cache is not None else None
             if stored is not None:
                 chosen = cm.choose(stored['candidates'], pick)
@@ -1776,16 +1779,32 @@ class PlaceCandidates:
         pc = pose_class
         if pc == 'auto' and hint.get('pose_class') in CLASSES and hint['pose_class'] != 'auto':
             pc = hint['pose_class']
-        profile, profile_dir = None, None
-        if isinstance(location, str) and Path(location).is_file():
-            try:
-                profile, profile_dir = json.loads(Path(location).read_text(encoding='utf-8')), Path(location).parent
-            except ValueError:
-                profile = None
-        objs = cm.enrich(cm.parse_objects(objects), profile, profile_dir, cfg)
-        labels = cm.classify(objs, cfg)
-        scale, scale_flags = cm.room_scale(objs, labels, cfg)
+        # E2: паспорт локации — опоры, плоскости и room_scale из него, без пересчёта; нет/не годен — как раньше
+        pp, passport_info, deferred = None, None, []
+        if isinstance(passport, str) and passport.strip():
+            pm = passport_helpers()
+            pp, problems = pm.loads(passport)
+            passport_info = {'used': False, 'problems': problems[:5]}
+            if pp is not None:
+                try:
+                    objs, labels, scale, scale_flags, pnotes = pm.to_candidates(pp, objects, pm.load_config())
+                    passport_info = {'used': True, 'id': pp.get('id'), 'confirmed': pp.get('confirmed'),
+                                     'notes': pnotes}
+                except ValueError as exc:
+                    pp, passport_info['problems'] = None, [str(exc)]
+        if pp is None:
+            profile, profile_dir = None, None
+            if isinstance(location, str) and Path(location).is_file():
+                try:
+                    profile, profile_dir = json.loads(Path(location).read_text(encoding='utf-8')), Path(location).parent
+                except ValueError:
+                    profile = None
+            objs = cm.enrich(cm.parse_objects(objects), profile, profile_dir, cfg)
+            labels = cm.classify(objs, cfg)
+            scale, scale_flags = cm.room_scale(objs, labels, cfg)
         cands = cm.plan(pc, objs, labels, hint, n, cfg, height_m, secondary_contacts, variant_set)
+        if pp is not None:
+            cands, deferred = pm.split_baseline(cands, pm.load_config())
         if cache is not None:
             try:
                 cache.begin()
@@ -1858,6 +1877,14 @@ class PlaceCandidates:
             index += 1
             # no_target по zone_too_small — сразу тот же вариант с мягкой зоной (место того же кандидата)
             queue[:0] = cm.retries(c, entry['place_status'], entry['flags'], cfg, entry['status'], rep, pc)
+            if not queue and deferred:
+                # E2: отложенный запасной «пол» — только если ни одна мебель не дала тела
+                if all(e['status'] == 'fallback' for e in entries):
+                    queue = deferred
+                passport_info['baseline'] = 'ran' if queue else 'skipped'
+                deferred = []
+                if queue:
+                    continue
             if not queue and not derived_done:
                 derived_done = True
                 first_run = [(c0, r0) for c0, e0, r0 in ran if c0.get('origin') is None]
@@ -1873,6 +1900,8 @@ class PlaceCandidates:
                   'variant_set': variant_set, 'limit_s': limit, 'computed_seconds': round(time.monotonic() - t0, 1),
                   'labels': {k: {'label': v['label'], **(v.get('features') or {})} for k, v in labels.items()},
                   'candidates': entries}
+        if passport_info is not None:
+            stored['passport'] = passport_info
         sheet = contact_sheet(tiles)
         if cache is not None:
             try:
@@ -1894,6 +1923,10 @@ class PlaceCandidates:
             notes.append('масштаб комнаты: ' + ', '.join(flags))
         if any(e['status'] == 'skipped_time' for e in entries):
             notes.append(f"лимит {limit:.0f} с: часть кандидатов не выполнена")
+        passport_info = stored.get('passport')
+        if passport_info is not None:
+            notes.append(f"паспорт {passport_info.get('id')}" + ('' if passport_info['used'] else ' не принят: ' +
+                                                                  '; '.join(passport_info['problems'][:2])[:160]))
         status = first + ' | ' + '; '.join(notes) + '\n' + json.dumps({
             'status': entry['status'], 'support_object': entry['support_object'],
             'support_gap_cm': entry['support_gap_cm'], 'max_penetration_cm': entry['max_penetration_cm'],
@@ -1904,6 +1937,8 @@ class PlaceCandidates:
                    'chosen': entry['index'], 'pick': pick, 'seconds': round(time.monotonic() - t0, 1),
                    'cache': cache_note, 'computed_seconds': stored.get('computed_seconds'),
                    'labels': stored['labels'], 'candidates': entries}
+        if stored.get('passport') is not None:
+            summary['passport'] = stored['passport']
         return tuple(outs[:5]) + (status,) + tuple(outs[6:]) + (json.dumps(summary, ensure_ascii=False, default=str),
                                                                 sheet)
 
@@ -1920,7 +1955,7 @@ class PlaceCandidates:
             return None
         (pose_class, support_parts, secondary_contacts, height_m, body_json, proxy, strength, seed, objects,
          n_candidates, block_on_fail, hint_json, pose_text, props, body_transform, megapixels, settings,
-         variant_set) = fields
+         variant_set, passport) = fields
         h = hashlib.sha256()
         h.update(PlacePose.fingerprint(location, props, body_json=body_json).encode('utf-8'))
         ref = pose_ref.detach().cpu().float().numpy() if hasattr(pose_ref, 'detach') else np.asarray(pose_ref)
@@ -1928,7 +1963,8 @@ class PlaceCandidates:
         h.update(np.ascontiguousarray(ref).tobytes())
         h.update(json.dumps([str(location), pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
                              strength, seed, objects, n_candidates, block_on_fail, hint_json, pose_text, props,
-                             body_transform, megapixels, settings, variant_set],
+                             body_transform, megapixels, settings, variant_set]
+                            + ([passport] if isinstance(passport, str) and passport.strip() else []),
                             ensure_ascii=False, sort_keys=True, default=str).encode('utf-8'))
         spec = importlib.util.spec_from_file_location('three_da_cand_cache', HERE / 'auto' / 'cand_cache.py')
         mod = importlib.util.module_from_spec(spec)
@@ -1938,10 +1974,91 @@ class PlaceCandidates:
         return mod.CandCache(root, h.hexdigest()[:32], c['keep'], c['tmp_age_s'])
 
 
+def passport_helpers():
+    import importlib.util
+    path = Path(config()['repo']) / 'tools/scene3d/posev2/passport.py'
+    spec = importlib.util.spec_from_file_location('three_da_passport', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def passport_dir():
+    """Кэш паспортов: папка пользователя ComfyUI user/default/3da/passports (её же отдаёт /api/userdata —
+    паспорт можно скачать и сохранить из браузера). THREEDA_PASSPORT_DIR — подмена для тестов."""
+    if os.environ.get('THREEDA_PASSPORT_DIR'):
+        return Path(os.environ['THREEDA_PASSPORT_DIR'])
+    import folder_paths
+    return Path(folder_paths.get_user_directory()) / 'default' / '3da' / 'passports'
+
+
+class LocationPassport:
+    """E2: паспорт локации — разовая разметка комнаты (мебель с типом, лицевой стороной и опорными плоскостями,
+    room_scale) в кэше <user>/3da/passports/<id>.json. Есть файл той же картинки — берётся он, без пересчёта;
+    человек проверяет preview, правит JSON и ставит "confirmed": true."""
+    failures = 0
+
+    @classmethod
+    def IS_CHANGED(cls, passport_id='', **kwargs):
+        # правка файла паспорта человеком — новый ключ (иначе ComfyUI отдаст старый выход из памяти)
+        try:
+            files = sorted(passport_dir().glob('*.json'))
+            key = ';'.join(f'{p.name}:{p.stat().st_mtime_ns}:{p.stat().st_size}' for p in files)
+        except Exception as exc:  # noqa: BLE001
+            key = 'passport-dir-error:' + str(exc)[:80]
+        return f'{passport_id}|{key}|{cls.failures}'
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {'required': {'location': ('STRING', {'forceInput': True, 'tooltip': 'Выход location узла 3DA Location'}),
+                             'objects': ('STRING', {'forceInput': True, 'tooltip': 'Выход objects узла 3DA Location'}),
+                             'plate': ('IMAGE', {'tooltip': 'Фото локации (выход plate узла 3DA Location)'})},
+                'optional': {'passport_id': ('STRING', {'default': '', 'tooltip': 'Имя паспорта; пусто — хэш картинки'})}}
+    RETURN_TYPES = ('STRING', 'IMAGE', 'BOOLEAN')
+    RETURN_NAMES = ('passport', 'preview', 'needs_review')
+    FUNCTION = 'execute'
+    CATEGORY = '3DA/auto'
+
+    def execute(self, location, objects, plate, passport_id=''):
+        t0 = time.monotonic()
+        try:
+            upstream = error_payload(location)
+            if upstream is not None:
+                raise ValueError('локация не готова: ' + upstream)
+            if plate.ndim != 4 or plate.shape[0] != 1 or plate.shape[-1] != 3:
+                raise ValueError('Expected one RGB location image')
+            pixels = np.clip(np.rint(plate[0].detach().cpu().float().numpy() * 255), 0, 255).astype('uint8')
+            pm = passport_helpers()
+            sha1 = pm.image_sha1(pixels)
+            pid = pm.safe_id(passport_id) if str(passport_id or '').strip() else sha1[:16]
+            plate_info, profile, profile_dir = None, None, None
+            if isinstance(location, str) and Path(location).is_file():
+                profile_dir = Path(location).parent
+                profile = json.loads(Path(location).read_text(encoding='utf-8'))
+                cfg = config()
+                assets = Path(cfg.get('location_asset_dirs', {}).get(profile.get('loc_id'), profile_dir))
+                if (assets / 'plate.json').is_file():
+                    plate_info = json.loads((assets / 'plate.json').read_text(encoding='utf-8'))
+
+            def build():
+                return pm.build(objects, profile, profile_dir, plate_info, pm.load_config(), pid, sha1)
+            passport, source, why = pm.get_or_build(passport_dir(), pid, sha1, build)
+            preview = pm.render_preview(Image.fromarray(pixels), passport, plate_info)
+            print(f'[3DA passport] {pid}: {source} ({why}), {time.monotonic() - t0:.2f} s', flush=True)
+            tensor = torch.from_numpy(np.asarray(preview, dtype=np.float32) / 255.)[None]
+            return json.dumps(passport, ensure_ascii=False), tensor, not passport.get('confirmed', False)
+        except Exception as exc:  # noqa: BLE001 — узел не роняет граф: кандидаты без паспорта работают как раньше
+            type(self).failures += 1
+            reason = short_reason(exc)
+            print(f'[3DA passport] ошибка: {reason}', flush=True)
+            return json.dumps({'3da_error': 'паспорт: ' + reason}, ensure_ascii=False), plate, True
+
+
 NODE_CLASS_MAPPINGS = {'3DAControl': Control, '3DABodyProfile': BodyProfile, '3DABodyMeasure': BodyMeasure, '3DALocation': Location, '3DAPlacePose': PlacePose, '3DAProp': Prop, '3DAH3Remote': H3Remote,
                        '3DANativeGuides': NativeGuides, '3DANativeComposite': NativeComposite,
                        '3DASceneEdits': SceneEdits, '3DASceneExport': SceneExport, '3DACoreWeights': CoreWeights,
-                       '3DABlenderRuntime': BlenderRuntime, '3DAPlaceCandidates': PlaceCandidates}
+                       '3DABlenderRuntime': BlenderRuntime, '3DAPlaceCandidates': PlaceCandidates,
+                       '3DALocationPassport': LocationPassport}
 NODE_DISPLAY_NAME_MAPPINGS = {'3DAControl': '3DA · 3D-контроль (пульт)', '3DABodyProfile': '3DA · Персонаж: телосложение', '3DABodyMeasure': '3DA · Персонаж: мерки', '3DALocation': '3DA Location', '3DAPlacePose': '3DA Place Pose',
                               '3DAProp': '3DA Prop', '3DAH3Remote': '3DA H3 Remote',
                               '3DANativeGuides': '3DA · native H3 guides + gate',
@@ -1950,4 +2067,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {'3DAControl': '3DA · 3D-контроль (пул�
                               '3DASceneExport': '3DA · подготовить 3D-сцену для гизмо',
                               '3DACoreWeights': '3DA Core Weights (MoGe-2, SAM 3D Body)',
                               '3DABlenderRuntime': '3DA Blender Runtime (bpy libs)',
-                              '3DAPlaceCandidates': '3DA · постановка: кандидаты'}
+                              '3DAPlaceCandidates': '3DA · постановка: кандидаты',
+                              '3DALocationPassport': '3DA · паспорт локации'}
