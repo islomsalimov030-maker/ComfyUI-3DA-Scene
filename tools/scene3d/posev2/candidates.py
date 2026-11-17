@@ -344,6 +344,23 @@ def merge_ids(sid, objects, labels, cfg):
     return ",".join(ids) if len(ids) > 1 else None
 
 
+def principal_axis(cells):
+    """Основная горизонтальная ось поверхности и длина её следа; недостаточно данных — None."""
+    if not cells or len(cells) < 3:
+        return None
+    try:
+        import numpy as np
+        points = np.asarray(cells, float)[:, :2]
+        centered = points - points.mean(0)
+        values, vectors = np.linalg.eigh(centered.T @ centered)
+        axis = vectors[:, int(np.argmax(values))]
+        projection = centered @ axis
+        length = float(np.percentile(projection, 98) - np.percentile(projection, 2))
+        return [float(axis[0]), float(axis[1])], length
+    except (ImportError, ValueError):
+        return None
+
+
 def floor_merge_ids(floor_id, objects, labels, cfg):
     """Пол без однозначного пола у профиля — куски на уровне пола (метка floor) в пределах geometry.merge_dh_m от
     выбранного: одна опора «floor_id,…» (иначе таз на соседнем куске пола того же уровня — wrong_surface); None —
@@ -392,14 +409,21 @@ def _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contac
     """Набор 0 (E1): опоры по классу и подсказке, «как сейчас» на полу, развороты стоя.
     only_support (E6) — один кандидат на эту опору (variant «neighbor»)."""
     floor_id = floor_choice(objects, labels)
+    objects_by_id = {o.get("id"): o for o in objects}
 
     def cand(variant, support, **kw):
         c = {"variant": variant, "target_object": support["type"] if support else "floor",
              "instance_hint": support["id"] if support else "", "support_id": support["id"] if support else None,
              "label": support["label"] if support else "floor", "secondary_contacts": secondary_contacts,
+             "support_parts": ",".join(cfg.get("lie_contact_support_parts", []))
+             if pose_class in ("lie", "recline") else None,
              "body_dx": 0.0, "body_dy": 0.0, "body_dz": 0.0, "body_dyaw": 0.0, "height_m": float(height_m),
              "floor_id": None}
         c.update(kw)
+        if support:
+            axis = principal_axis(_cells(objects_by_id.get(support["id"], {})))
+            if axis:
+                c["support_axis_xy"], c["support_length_m"] = axis
         if support and c["label"] not in ("floor", "auto"):
             c["merge_ids"] = merge_ids(support["id"], objects, labels, cfg)
             c["attempts"] = cfg["furniture_attempts"]
@@ -453,6 +477,29 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
         if flags & set(cfg["flip_flags"]) or (isinstance(back, (int, float)) and back > cfg["back_gap_flip_cm"]):
             extra.append(dict(c, variant="yaw+180", body_dyaw=180.0, origin="derived"))
     out = extra[:max(0, n_max - len(cands))]
+    if cands and results:
+        frames = [(r or {}).get("report", {}).get("frame") or {} for r in results]
+        limits = cfg["frame"]
+        bad = []
+        for frame in frames:
+            box, size = frame.get("bbox_px"), frame.get("frame_px")
+            if not (isinstance(box, list) and len(box) == 4 and isinstance(size, list) and len(size) == 2 and size[1]):
+                continue
+            frac = max(0.0, float(box[3]) - float(box[1])) / float(size[1])
+            bottom_crop = box[3] > size[1] and frac < limits["closeup_height_frac"]
+            cropped = box[0] < 0 or box[2] > size[0] or box[1] < 0 or bottom_crop
+            bad.append(not frame.get("visible") or cropped or frac > limits["height_max_frac"] or
+                       frac < limits["height_min_frac"])
+        if bad and all(bad):
+            base = best_cand or cands[0]
+            length = base.get("support_length_m")
+            shifts = ([(float(length) * fraction / 3, 0.0) for fraction in cfg["frame_shifts_thirds"]]
+                      if base.get("support_axis_xy") and isinstance(length, (int, float)) and length > 0
+                      else cfg["frame_shifts_m"])
+            for dx, dy in shifts:
+                out.append(dict(base, variant=f"frame_shift{dx:+g},{dy:+g}",
+                                body_dx=float(base.get("body_dx") or 0.0) + dx,
+                                body_dy=float(base.get("body_dy") or 0.0) + dy, origin="derived"))
     if "room_scale_suspect" in scale_flags and scale and cands:
         best = best_cand or cands[0]
         out.append(dict(best, variant="room_scale", height_m=round(best["height_m"] / scale, 3), origin="derived"))
@@ -547,15 +594,37 @@ def score(cand, status, rep, pose_class, cfg):
     else:
         tier = (1.0, s["support_tier1"], s["support_tier2"])[rank[0]]
         comp["support_class"] = max(0.0, tier - rank[1] * s["support_step"])
-    comp["visibility"] = visibility(rep.get("frame") or {}, s)
+    frame = rep.get("frame") or {}
+    vis = visibility(frame, s, rep.get("keypoints_body25_px"))
+    comp["visibility"] = min(1.0, vis / cfg["visibility"]["min_visible_frac"])
+    box, size = frame.get("bbox_px"), frame.get("frame_px")
+    height_frac = None
+    crop = 0.0
+    if isinstance(box, list) and len(box) == 4 and isinstance(size, list) and len(size) == 2 and size[1] > 0:
+        height_frac = max(0.0, float(box[3]) - float(box[1])) / float(size[1])
+        limits = cfg["frame"]
+        lower_crop_allowed = box[3] > size[1] and height_frac >= limits["closeup_height_frac"]
+        cropped = box[0] < 0 or box[2] > size[0] or box[1] < 0 or (box[3] > size[1] and not lower_crop_allowed)
+        crop = 1.0 if cropped else 0.0
+    comp["frame_height"] = (1.0 if height_frac is None else
+                            0.0 if height_frac > cfg["frame"]["height_max_frac"] or
+                            height_frac < cfg["frame"]["height_min_frac"] else 1.0)
+    comp["crop"] = 1.0 - crop
+    depth = rep.get("support_depth_m")
+    comp["depth"] = (0.0 if isinstance(depth, (int, float)) and depth < cfg["depth"]["min_depth_m"]
+                     else 1.0)
     total_w = sum(w.values())
     # без постановки (fallback, no_target) итог 0: верная метка опоры не делает пустой вариант лучше реального
     value = sum(w[k] * comp[k] for k in w) / total_w if total_w and comp["status"] > 0 else 0.0
     return round(value, 4), {k: round(v, 3) for k, v in comp.items()}
 
 
-def visibility(frame, s):
-    """Доля рамки тела (bbox_px) внутри кадра (frame_px); нет рамки — по флагам ok/visible."""
+def visibility(frame, s, keypoints=None):
+    """Прокси видимости: доля видимых 3DA ключевых точек (depth-tested), иначе доля bbox в кадре."""
+    if isinstance(keypoints, list):
+        values = [p[2] for p in keypoints[:25] if isinstance(p, list) and len(p) >= 3 and p[2] in (0, 1)]
+        if values:
+            return round(sum(values) / len(values), 3)
     box, size = frame.get("bbox_px"), frame.get("frame_px")
     if frame.get("ok"):
         return 1.0

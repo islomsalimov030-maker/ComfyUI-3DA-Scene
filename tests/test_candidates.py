@@ -88,6 +88,8 @@ def test_plan_counts_and_variants():
     stand = C.plan('stand', objs, lab, {'near_wall': True}, 4, CFG, 2.30)
     assert [c['variant'] for c in stand] == ['floor', 'wall', 'yaw+25', 'yaw-25']
     assert stand[0]['target_object'] == 'floor' and 'back:wall' in stand[1]['secondary_contacts']
+    lie = C.plan('lie', objs, lab, {}, 2, CFG, 2.30)
+    assert lie and lie[0]['support_parts'] == 'pelvis,torso'
     assert len(C.plan('stand', objs, lab, {}, 1, CFG, 2.30)) == 1
     assert C.plan('auto', objs, lab, {}, 4, CFG, 2.30)[0]['variant'] == 'auto'
 
@@ -106,6 +108,47 @@ def test_room_scale():
     assert extra[-1]['variant'] == 'room_scale' and abs(extra[-1]['height_m'] - 2.30 / 1.5) < .01
 
 
+def test_candidate_cli_adds_camera_depth(monkeypatch, tmp_path):
+    sys.path.insert(0, str(ROOT / 'tools/scene3d'))
+    import candidates_cli as CLI
+
+    class Plate:
+        def __init__(self, path):
+            pass
+
+        def project(self, points):
+            return np.array([0.]), np.array([0.]), np.array([1.25])
+
+    PF = type('PF', (), {'Plate': Plate})
+
+    monkeypatch.setattr(CLI.pack_cli, 'required_file', lambda value, label: tmp_path / 'profile.json')
+    monkeypatch.setattr(CLI.pack_cli, 'read_json', lambda path: {
+        'loc_id': 'loc', 'objects': [{'id': 'surf_1', 'center_m': [1., 2., .5]}]})
+    monkeypatch.setattr(CLI.pack_cli, 'location_id', lambda value: value)
+    monkeypatch.setattr(CLI.pack_cli, 'assets_for', lambda config, loc_id, profile_dir: tmp_path)
+    monkeypatch.setattr(CLI.pack_cli, 'modules', lambda config: (PF, None))
+    result = {'report': {'target_instance': 'surf_1'}}
+    assert CLI.add_support_depth({'location': 'profile'}, {}, result) is result
+    assert result['report']['support_depth_m'] == 1.25
+
+
+def test_principal_axis_for_same_support_offsets():
+    result = C.principal_axis(cells(0, 0, 1.2, 0.3, .1))
+    assert result is not None
+    axis, length = result
+    assert abs(abs(axis[0]) - 1.0) < 1e-6 and length > 1.0
+
+
+def test_derived_frame_shifts_require_bad_frame_evidence():
+    cand = {'variant': 'support', 'support_id': 'surf_1', 'label': 'sofa', 'body_dx': 0., 'body_dy': 0.}
+    missing = C.derived([cand], [{'report': {}}], CFG, 1, [], None, cand)
+    assert missing == []
+    bad = {'frame': {'bbox_px': [0, 0, 900, 900], 'frame_px': [800, 800], 'visible': True}}
+    shifted = C.derived([cand], [{'report': bad}], CFG, 1, [], None, cand)
+    assert len(shifted) == len(CFG['frame_shifts_m'])
+    assert shifted[1]['support_id'] == 'surf_1' and shifted[1]['body_dx'] == CFG['frame_shifts_m'][1][0]
+
+
 def rep(status, gap=1.0, pen=1.0, frame_ok=True):
     return {'status': status, 'support_gap_cm': gap, 'max_penetration_cm': pen, 'frame': {'ok': frame_ok, 'visible': True},
             'orient': {'total_change_deg': 5.0}, 'angle_to_camera_deg': {'ref': 10.0, 'plate': 20.0}}
@@ -121,7 +164,25 @@ def test_score_ranking_and_pick():
     s_fb, _ = C.score(sofa, 'fallback', {}, 'sit_edge', CFG)
     assert 0 <= s_fb < s_wrong < s_partial < s_ok <= 1
     assert s_bed < s_ok                                   # та же постановка, но опора ниже в списке класса
-    assert set(comp) == {'status', 'gap', 'penetration', 'pose_match', 'support_class', 'visibility'}
+    assert set(comp) == {'status', 'gap', 'penetration', 'pose_match', 'support_class', 'visibility',
+                         'frame_height', 'crop', 'depth'}
+    _, oversized = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
+                            'bbox_px': [100, -10, 300, 760], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
+    assert oversized['frame_height'] == 0.0 and oversized['crop'] == 0.0
+    _, closeup = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
+                           'bbox_px': [100, 100, 300, 790], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
+    assert closeup['frame_height'] == 0.0 and closeup['crop'] == 1.0
+    _, lower_edge = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
+                              'bbox_px': [100, 100, 300, 900], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
+    assert lower_edge['crop'] == 1.0                 # нижний край допустим на крупном плане
+    _, small_bottom_crop = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
+                                   'bbox_px': [100, 600, 300, 820], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
+    assert small_bottom_crop['crop'] == 0.0          # на среднем плане обрезание штрафуется
+    occluded = [[0., 0., 1]] * 3 + [[0., 0., 0]] * 7
+    _, mostly_hidden = C.score(sofa, 'ok', {**rep('ok'), 'keypoints_body25_px': occluded}, 'sit_edge', CFG)
+    assert mostly_hidden['visibility'] == 0.5
+    _, shallow = C.score(sofa, 'ok', {**rep('ok'), 'support_depth_m': 1.2}, 'sit_edge', CFG)
+    assert shallow['depth'] == 0.0
     entries = [{'index': 0, 'score': .4}, {'index': 1, 'score': .9}, {'index': 2, 'score': .9}, {'index': 3, 'score': None}]
     assert C.choose(entries, -1)['index'] == 1
     assert C.choose(entries, 2)['index'] == 2

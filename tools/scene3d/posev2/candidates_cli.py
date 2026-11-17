@@ -145,11 +145,37 @@ def summary(report):
     return json.loads(json.dumps(out, default=str))
 
 
+def add_support_depth(request, config, result):
+    """Добавить глубину центра выбранной опоры в системе камеры (только отчёт нового узла)."""
+    report = result.get("report") if isinstance(result, dict) else None
+    if not isinstance(report, dict):
+        return result
+    try:
+        import numpy as np
+        profile_path = pack_cli.required_file(request.get("location"), "location profile.json")
+        profile = pack_cli.read_json(profile_path)
+        sid = report.get("target_instance") or report.get("support_object")
+        obj = next((o for o in profile.get("objects", []) if o.get("id") == sid), None)
+        point = (obj or {}).get("center_m") or (obj or {}).get("seed_world")
+        if not (isinstance(point, list) and len(point) >= 3):
+            return result
+        plate_dir = pack_cli.assets_for(config, pack_cli.location_id(profile.get("loc_id")), profile_path.parent)
+        pf, _ = pack_cli.modules(config)
+        plate = pf.Plate(plate_dir)
+        _, _, depths = plate.project(np.asarray([point[:3]], dtype=float))
+        depth = float(depths[0])
+        if np.isfinite(depth) and depth > 0:
+            report["support_depth_m"] = depth
+    except Exception:  # depth is advisory; placement output must remain usable
+        return result
+    return result
+
+
 def geometry_worker(request, config):
     captured = {}
     patch(request, config, captured)
     try:
-        return pack_cli.do_place(request, config)
+        return add_support_depth(request, config, pack_cli.do_place(request, config))
     except Exception as exc:
         result = pack_cli.error_result(exc)
         if captured.get("report") is not None:

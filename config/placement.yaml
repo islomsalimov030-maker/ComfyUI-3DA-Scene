@@ -318,6 +318,7 @@ candidates:
     sit_edge: [pelvis]        # бёдра над невидимой частью сиденья не «висят» — там просто нет маски
     sit_tucked: [pelvis]
     lie: [pelvis, torso]
+  lie_contact_support_parts: [pelvis, torso] # лёжа/полулёжа: проверять таз и корпус на одной опоре
   settle:                     # тело над опорой (wrong_surface/contact_fail по зазору) → то же место ниже на body_dz
     statuses: [wrong_surface, contact_fail]
     target_m: 0.02            # дальняя опорная часть (медиана зазора) — до 2 см (часть «на опоре» при ≤ place.on_surf_m 4 см)
@@ -381,13 +382,26 @@ candidates:
     bed: [0.45, 0.60]
   scale_from_geometry_labels: false  # геометрические метки выведены из высоты — по ним масштаб не считаем
   room_scale_tol: 0.15        # |room_scale − 1| больше — room_scale_suspect и кандидат с height_m / room_scale
+  frame_shifts_m: [[0.0, 0.0], [0.5, 0.0], [-0.5, 0.0]] # резерв, если паспорт/профиль не дал размеры опоры
+  frame_shifts_thirds: [0, 1, -1] # центр и сдвиги по горизонтали кадра на треть длины опоры в обе стороны
+  frame:                      # новые визуальные составляющие (оценка по проекции bbox из отчёта постановки)
+    height_min_frac: 0.15     # слишком маленькая доля высоты кадра — штраф
+    height_max_frac: 0.85     # слишком большая доля высоты кадра — штраф
+    closeup_height_frac: 0.85 # нижний край допускается для крупных планов; боковые/верхний края — нет
+  depth:
+    min_depth_m: 1.8          # близкая к камере опора штрафуется, когда отчёт содержит глубину опоры
+  visibility:
+    min_visible_frac: 0.6     # менее 60% depth-tested 3DA keypoints — прокси скрытого силуэта
   weights:                    # итоговая оценка 0..1 = Σ вес·составляющая / Σ весов
-    status: 0.35
-    gap: 0.10
-    penetration: 0.10
-    pose_match: 0.10
-    support_class: 0.25
+    status: 0.30
+    gap: 0.08
+    penetration: 0.08
+    pose_match: 0.08
+    support_class: 0.20
     visibility: 0.10
+    frame_height: 0.08
+    crop: 0.05
+    depth: 0.03
   score:
     status: {ok: 1.0, partial: 0.7, out_of_frame: 0.3, contact_fail: 0.2, wrong_surface: 0.1, no_target: 0.0, fallback: 0.0}
     gap_scale_cm: 5.0

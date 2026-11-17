@@ -1788,6 +1788,12 @@ class PlaceCandidates:
             if pp is not None:
                 try:
                     objs, labels, scale, scale_flags, pnotes = pm.to_candidates(pp, objects, pm.load_config())
+                    if isinstance(location, str) and Path(location).is_file():
+                        try:
+                            profile = json.loads(Path(location).read_text(encoding='utf-8'))
+                            objs = cm.enrich(objs, profile, Path(location).parent, cfg)
+                        except (OSError, ValueError):
+                            pass
                     passport_info = {'used': True, 'id': pp.get('id'), 'confirmed': pp.get('confirmed'),
                                      'notes': pnotes}
                 except ValueError as exc:
@@ -1838,6 +1844,7 @@ class PlaceCandidates:
                      'status': st, 'place_status': place_status,
                      'support_object': cm.actual_support(rep, c, labels, objs) if st != 'fallback' else 'other',
                      'support_gap_cm': rep.get('support_gap_cm'), 'max_penetration_cm': rep.get('max_penetration_cm'),
+                     'support_depth_m': rep.get('support_depth_m'),
                      'flags': rep.get('flags'), 'zone': (rep.get('zone_diagnostics') or {}) if st == 'fallback' else None,
                      'error': outs[5].partition('\n')[0][:200] if st == 'fallback' else None,
                      'score': value, 'components': comp, 'seconds': round(time.monotonic() - started, 1)}
