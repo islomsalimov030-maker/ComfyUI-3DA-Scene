@@ -164,7 +164,7 @@ def parse_hint(text, prompt='', cfg=None):
     lowered = {str(k).strip().lower(): v for k, v in value.items()}
     for name in FIELDS:
         if name not in lowered:
-            if name in REQUIRED and value:
+            if name in REQUIRED:
                 problems.append(f'нет поля {name}')
             got = None
         else:

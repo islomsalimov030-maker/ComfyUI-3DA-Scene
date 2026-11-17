@@ -88,6 +88,14 @@ def test_bad_value_field_fallback(field, bad):
     assert all(hint[k] == v for k, v in others.items())     # верные поля модели не трогаются
 
 
+def test_empty_object_uses_fallback():
+    prompt = 'A person sitting on a chair facing the camera'
+    hint, ok, note = hint_of('{}', prompt)
+    assert not ok and all(f'нет поля {field}' in note for field in P.REQUIRED)
+    assert hint == P.keyword_hint(prompt, CFG)
+    assert hint['pose_class'] == 'sit_edge' and hint['support'] == 'chair'
+
+
 def test_missing_field():
     value = json.loads(GOOD)
     del value['near_wall'], value['prop']
