@@ -8,23 +8,28 @@ const KEY = '3DA Pose Edits';
 const RADIUS = 0.03;
 const COLOR = 0xffc400, ACTIVE = 0xff3d00, EDITED = 0x00e5ff;
 
-export function poseHandles(view, body, node, changed) {
+export function poseHandles(view, body, node, changed, report = () => {}) {
   const rig = body.pose_rig;
   const K = rig?.kp_local, conf = rig?.config;
-  if (!Array.isArray(K) || K.length !== 70 || !conf) return null;
+  if (!Array.isArray(K) || K.length !== 70 || !conf) {
+    report('disabled', 'нет корректного скелета позы');
+    return null;
+  }
   const scene = view.getSceneManager?.()?.scene;
   const meshes = [];
   body.object.traverse(o => { if (o.isMesh && o.geometry?.attributes?.position) meshes.push(o); });
-  if (!scene || !meshes.length) return null;
+  if (!scene || !meshes.length) {
+    report('disabled', !scene ? '3D-сцена недоступна' : 'у тела нет меша с вершинами');
+    return null;
+  }
   body.object.updateMatrixWorld(true);
-  // Точки скелета — в локальных осях тела; меши GLB тела лежат в них же (узел тела или его дети без сдвига).
-  const inv = body.object.matrixWorld.clone().invert();
+  // Отдельные части GLB могут иметь собственные трансформации и общую геометрию.
+  // Каждой части нужна своя копия: веса и деформированные вершины зависят от её матрицы.
+  const seen = new Set();
   for (const m of meshes) {
-    const e = inv.clone().multiply(m.matrixWorld).elements;
-    if (e.some((x, i) => Math.abs(x - (i % 5 === 0 ? 1 : 0)) > 1e-6)) {
-      console.warn('3DA: меш тела со своим сдвигом — ручки позы отключены');
-      return null;
-    }
+    const geometry = m.geometry;
+    if (seen.has(geometry)) m.geometry = geometry.clone();
+    else seen.add(geometry);
   }
   const rest = handlePoints(K);
   const vec = (p) => body.object.position.clone().set(p[0], p[1], p[2]);
@@ -52,12 +57,34 @@ export function poseHandles(view, body, node, changed) {
     mesh.name = '3DA_handle_' + h;
     mesh.renderOrder = 999;
     mesh.frustumCulled = false;
+    mesh.visible = false;
     mesh.raycast = () => {};
     mesh.userData.threedaHandle = h;
     scene.add(mesh);
     spheres[h] = mesh;
   }
-  let active = null, posed = rest, frame = 0;
+  let active = null, posed = rest, frame = 0, ready = false, disposed = false, visible = true;
+  let paintFrame = 0, prewarm = null, finishPreparation;
+  const preparation = new Promise(resolve => { finishPreparation = resolve; });
+  const pendingEditsError = () => new Error('Ручки позы: сохранение недоступно — правки не применены в 3D-окне. Исправьте ошибку подготовки или загрузите сцену заново.');
+  const idle = globalThis.requestIdleCallback ?? (f => setTimeout(f, 0));
+  const cancelIdle = globalThis.cancelIdleCallback ?? clearTimeout;
+  function fail(e) {
+    ready = false;
+    // A later part may fail after an earlier one was deformed. Restore all parts.
+    for (const m of meshes) {
+      const g = m.geometry, rest = g.userData.threedaRest;
+      if (!rest) continue;
+      g.attributes.position.array.set(rest);
+      g.attributes.position.needsUpdate = true;
+      try { g.computeVertexNormals?.(); g.computeBoundingSphere?.(); g.computeBoundingBox?.(); } catch (_) { /* keep restored vertices */ }
+    }
+    posed = rest;
+    for (const h of HANDLES) spheres[h].visible = false;
+    finishPreparation();
+    report('disabled', 'ошибка построения или применения весов: ' + (e?.message || String(e)));
+    view.forceRender?.();
+  }
   const limit = conf.max_offset_m * 0.99;
   const color = (h) => {
     const m = spheres[h].material;
@@ -65,25 +92,35 @@ export function poseHandles(view, body, node, changed) {
     m.color?.setHex?.(c); m.emissive?.setHex?.(c); m.emissiveIntensity = 0.6;
   };
   // Рест-позиции и веса — один раз на геометрию (переживают пересоздание 3D-окна).
-  const key = JSON.stringify(K);
   function rigOf(mesh) {
+    body.object.updateMatrixWorld(true);
     const g = mesh.geometry, u = g.userData;
+    const toBody = body.object.matrixWorld.clone().invert().multiply(mesh.matrixWorld);
+    const key = JSON.stringify([K, conf]);
+    // inverse(body.world) * mesh.world has round-off noise after moving the body.
+    // Compare relative transforms with tolerance, not their JSON representation.
+    const sameMatrix = u.threedaRigMatrix?.every((x, i) => Math.abs(x - toBody.elements[i]) <= 1e-9);
     if (!u.threedaRest) u.threedaRest = Float32Array.from(g.attributes.position.array);
-    if (!u.threedaRig || u.threedaRigKey !== key) {
+    if (!u.threedaRig || u.threedaRigKey !== key || !sameMatrix) {
       const t0 = performance.now();
-      u.threedaRig = buildWeights(u.threedaRest, g.index?.array ?? null, K, conf);
+      const bodyRest = transformPositions(u.threedaRest, toBody, vec([0, 0, 0]));
+      u.threedaRig = buildWeights(bodyRest, g.index?.array ?? null, K, conf);
       u.threedaRigKey = key;
+      u.threedaRigMatrix = [...toBody.elements];
       console.info(`[3DA] веса позы: ${u.threedaRig.nU} вершин, диффузия ${u.threedaRig.iters}, ${Math.round(performance.now() - t0)} мс`);
     }
-    return u.threedaRig;
+    return { rig: u.threedaRig, toMesh: toBody.invert() };
   }
   function apply() {
     const edits = Object.keys(offsets).length ? offsets : null;
     const { T } = solve(K, edits ?? {}, conf);
     for (const m of meshes) {
       const g = m.geometry, pos = g.attributes.position;
-      if (edits) deform(rigOf(m), T, pos.array);
-      else if (g.userData.threedaRest) pos.array.set(g.userData.threedaRest);
+      if (edits) {
+        const { rig, toMesh } = rigOf(m);
+        deform(rig, T, pos.array);
+        transformPositions(pos.array, toMesh, vec([0, 0, 0]), pos.array);
+      } else if (g.userData.threedaRest) pos.array.set(g.userData.threedaRest);
       else continue;
       pos.needsUpdate = true;
       g.computeVertexNormals?.();
@@ -105,11 +142,15 @@ export function poseHandles(view, body, node, changed) {
     }
   }
   function schedule() {
-    if (frame) return;
-    frame = requestAnimationFrame(() => { frame = 0; apply(); view.forceRender?.(); changed?.(); });
+    if (frame || !ready || disposed) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      try { apply(); view.forceRender?.(); changed?.(); } catch (e) { fail(e); }
+    });
   }
   // Ручку двигает гизмо (или пульт): новый сдвиг = её место в осях тела минус исходное.
   function moved(h) {
+    if (!ready || disposed) return;
     body.object.updateMatrixWorld(true);
     const p = body.object.worldToLocal(spheres[h].position.clone());
     const target = [p.x, p.y, p.z];
@@ -126,29 +167,63 @@ export function poseHandles(view, body, node, changed) {
   // Для body_transform: сдвиг ручки в мировых осях 3D-окна (с учётом поворота/масштаба тела).
   function worldDeltas() {
     body.object.updateMatrixWorld(true);
+    if (disposed || ((!ready || frame) && Object.keys(offsets).length)) throw pendingEditsError();
     const out = {};
+    const current = posed;
     for (const h of Object.keys(offsets)) {
-      const a = body.object.localToWorld(vec(rest[h])), b = body.object.localToWorld(vec(local(h)));
+      const a = body.object.localToWorld(vec(rest[h])), b = body.object.localToWorld(vec(current[h]));
       out[h] = clampLength([b.x - a.x, b.y - a.y, b.z - a.z], limit).map(x => Math.round(x * 1e6) / 1e6);
     }
     return out;
   }
-  if (Object.keys(offsets).length) apply(); else sync();
-  // Веса — заранее, пока художник выбирает ручку: иначе первое движение ждёт их построения (~1–2 с на 300 тыс. вершин).
-  const idle = globalThis.requestIdleCallback ?? (f => setTimeout(f, 300));
-  const cancelIdle = globalThis.cancelIdleCallback ?? clearTimeout;
-  let prewarm = idle(() => { prewarm = null; try { for (const m of meshes) rigOf(m); } catch (e) { console.error('3DA веса позы:', e); } },
-    { timeout: 2000 });
+  report('preparing', 'Ручки позы: подготовка…');
+  // Веса строятся вне основного кадра; интерфейс явно показывает ожидание.
+  paintFrame = requestAnimationFrame(() => {
+    paintFrame = requestAnimationFrame(() => {
+      paintFrame = 0;
+      prewarm = idle(() => {
+        prewarm = null;
+        try {
+          for (const m of meshes) rigOf(m);
+          if (disposed) return;
+          if (Object.keys(offsets).length) apply(); else sync();
+          ready = true;
+          for (const h of HANDLES) spheres[h].visible = visible;
+          report('ready', 'Ручки позы готовы');
+          finishPreparation();
+          view.forceRender?.();
+        } catch (e) { if (!disposed) fail(e); }
+      }, { timeout: 2000 });
+    });
+  });
   return {
     handles: HANDLES, labels: HANDLE_LABELS,
     sphere: h => spheres[h],
     hasEdits: () => Object.keys(offsets).length > 0,
+    canCapture: () => !frame && (!Object.keys(offsets).length || (ready && !disposed)),
+    async waitForEdits() {
+      if (!Object.keys(offsets).length && !frame) return;
+      await preparation;
+      if (!ready || disposed) throw pendingEditsError();
+      if (frame) {
+        cancelAnimationFrame(frame); frame = 0;
+        try { apply(); view.forceRender?.(); changed?.(); } catch (e) { fail(e); throw pendingEditsError(); }
+      }
+      return true;
+    },
     worldDeltas, moved, sync,
     highlight(h) { active = h; for (const k of HANDLES) color(k); },
-    reset(h) { if (h) delete offsets[h]; else for (const k of HANDLES) delete offsets[k]; apply(); view.forceRender?.(); changed?.(); },
-    setVisible(v) { for (const h of HANDLES) spheres[h].visible = v; },
+    reset(h) {
+      if (!ready || disposed) return;
+      if (h) delete offsets[h]; else for (const k of HANDLES) delete offsets[k];
+      try { apply(); view.forceRender?.(); changed?.(); } catch (e) { fail(e); }
+    },
+    setVisible(v) { visible = v; for (const h of HANDLES) spheres[h].visible = v && ready; },
     dispose() {
+      disposed = true;
+      finishPreparation();
       if (frame) cancelAnimationFrame(frame);
+      if (paintFrame) cancelAnimationFrame(paintFrame);
       if (prewarm) cancelIdle(prewarm);
       for (const h of HANDLES) { scene.remove(spheres[h]); spheres[h].geometry.dispose(); spheres[h].material.dispose(); }
       view.forceRender?.();
@@ -169,6 +244,14 @@ function sphereMesh(r, seg, rings) {
     idx.push(a, b, a + 1, b, b + 1, a + 1);
   }
   return { positions: new Float32Array(pos), indices: new Uint16Array(idx) };
+}
+
+function transformPositions(src, matrix, target, out = new Float32Array(src.length)) {
+  for (let i = 0; i < src.length; i += 3) {
+    target.set(src[i], src[i + 1], src[i + 2]).applyMatrix4(matrix);
+    out[i] = target.x; out[i + 1] = target.y; out[i + 2] = target.z;
+  }
+  return out;
 }
 
 function clampLength(v, limit) {

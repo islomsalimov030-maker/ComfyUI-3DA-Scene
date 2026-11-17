@@ -339,6 +339,16 @@ def test_frontend_matches_backend(tmp_path, body):
         assert np.allclose(res['H'][h], H[h], atol=1e-5), h
 
 
+@pytest.mark.skipif(NODE is None, reason='node не установлен')
+def test_pose_handles_mesh_transforms_cpu(tmp_path):
+    """Реальный poseHandles.js: матрицы частей, деформация, общая геометрия и сброс."""
+    K = skeleton()
+    X, F = body_mesh(K)
+    data = tmp_path / 'pose_handles.json'
+    data.write_text(json.dumps(dict(K=K.tolist(), X=X.ravel().tolist(), F=F.ravel().tolist(), conf=CONF)), encoding='utf-8')
+    subprocess.run([NODE, str(ROOT / 'tests/pose_handles_cpu.mjs'), str(data)], check=True, timeout=120)
+
+
 # ---------------------------------------------------------------------------------------------- круг 2: обратный сгиб
 FWD = np.array([1., 0, 0])                               # «вперёд» в случаях из ревью
 KNEE_CASES = {

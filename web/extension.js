@@ -97,7 +97,8 @@ function adaptCopies(service) {
     record.scene = sceneSelection(target, owner.node, transforms);
     record.lock.restore();
     await restoreRoom(record);
-    if (record.scene) owner.node.properties['3DA Scene Transforms'] = record.scene.capture();
+    const captured = record.scene?.capture();
+    if (captured) owner.node.properties['3DA Scene Transforms'] = captured;
     return result;
   };
   service.copyLoad3dState = adapted;
@@ -187,7 +188,7 @@ async function tick() {
         if (record.scene) {
           record.scene.syncMode();
           const transforms = record.scene.capture();
-          if (JSON.stringify(node.properties['3DA Scene Transforms']) !== JSON.stringify(transforms))
+          if (transforms && JSON.stringify(node.properties['3DA Scene Transforms']) !== JSON.stringify(transforms))
             node.properties['3DA Scene Transforms'] = transforms;
         }
         await restoreRoom(record);
@@ -196,6 +197,11 @@ async function tick() {
       if (widget?.serializeValue && widget.serializeValue !== record.serialize) {
         record.originalSerialize = widget.serializeValue;
         record.serialize = async function (...args) {
+          // Only pose edits require a ready preview. Legacy scenes keep their fallback.
+          const scene = record.scene;
+          const checkedPose = await scene?.waitForEdits?.();
+          if (checkedPose && scene !== record.scene)
+            throw new Error('Ручки позы: сцена изменилась во время подготовки — повторите сохранение.');
           record.lock.restore();
           // E10: сферы-ручки позы не попадают в снимки 3D-окна.
           record.scene?.setHandlesVisible?.(false);
@@ -206,6 +212,8 @@ async function tick() {
             // 0.3.2: never throw here — a throw blocks Export and Run («reading 'workflow'»).
             // Scene not loaded yet: keep the last captured transforms (or none → 3DA falls back, no error).
             const transforms = record.scene ? record.scene.capture() : node.properties['3DA Scene Transforms'];
+            if (checkedPose && (!transforms || scene !== record.scene))
+              throw new Error('Ручки позы: предпросмотр изменился или не готов — повторите сохранение после подготовки.');
             if (transforms) {
               node.properties['3DA Scene Transforms'] = transforms;
               result.model_3d_info = transforms;

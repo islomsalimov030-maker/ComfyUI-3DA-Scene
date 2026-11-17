@@ -22,10 +22,20 @@ export function sceneSelection(view, node, initialTransforms = null) {
   root.updateMatrixWorld(true);
   // E10: ручки позы манекена (кисти, стопы, грудь) — только у тела, только если экспорт дал скелет.
   const bodyEntity = entities.find(e => e.kind === 'body');
-  let pose = null;
-  try { pose = bodyEntity ? poseHandles(view, bodyEntity, node, () => refresh()) : null; }
-  catch (e) { console.error('3DA pose handles:', e); }
+  let pose = null, poseState = 'preparing', poseMessage = 'Ручки позы: подготовка…';
+  let updatePoseUI = () => {};
+  const poseReport = (state, message) => {
+    poseState = state;
+    poseMessage = state === 'disabled' ? 'Ручки позы отключены: ' + message : message;
+    updatePoseUI();
+  };
+  try {
+    if (bodyEntity) pose = poseHandles(view, bodyEntity, node, () => refresh(), poseReport);
+    else poseReport('disabled', 'тело отсутствует в сцене');
+  } catch (e) { poseReport('disabled', 'ошибка инициализации: ' + (e?.message || String(e))); }
   function capture() {
+    // tick must keep the last consistent capture while saved edits are preparing.
+    if (pose && !pose.canCapture()) return null;
     root.updateMatrixWorld(true);
     return entities.map(e => {
       const p = e.object.getWorldPosition(e.object.position.clone());
@@ -50,11 +60,13 @@ export function sceneSelection(view, node, initialTransforms = null) {
   picker.className = 'threeda-entity-selector';
   Object.assign(picker.style, { color:'white', background:'#263744', padding:'5px', maxWidth:'240px' });
   for (const e of entities) picker.add(new Option(e.label, e.id));
+  let handleGroup = null;
   if (pose) {
-    const group = document.createElement('optgroup');
-    group.label = 'Ручки позы манекена';
-    for (const h of pose.handles) group.appendChild(new Option('◉ ' + pose.labels[h], 'h:' + h));
-    picker.appendChild(group);
+    handleGroup = document.createElement('optgroup');
+    handleGroup.label = 'Ручки позы манекена';
+    handleGroup.disabled = true;
+    for (const h of pose.handles) handleGroup.appendChild(new Option('◉ ' + pose.labels[h], 'h:' + h));
+    picker.appendChild(handleGroup);
   }
   const modes = document.createElement('select');
   modes.className = 'threeda-mode-selector';
@@ -85,12 +97,17 @@ export function sceneSelection(view, node, initialTransforms = null) {
   resetPose.title = 'Вернуть все ручки: поза — как после постановки';
   for (const b of [resetHandle, resetPose])
     Object.assign(b.style, { color:'white', background:'#263744', padding:'5px 8px', border:'1px solid #4b6070', cursor:'pointer' });
-  toolbar.append(picker,modes,toFrame,...(pose ? [resetHandle, resetPose] : []),status);
+  const poseStatus = document.createElement('span');
+  poseStatus.className = 'threeda-pose-status';
+  poseStatus.setAttribute('role', 'status');
+  Object.assign(poseStatus.style, { color:'white', padding:'5px 8px', borderRadius:'4px',
+    font:'12px sans-serif', background:'#37474f' });
+  toolbar.append(picker,modes,toFrame,...(pose ? [resetHandle, resetPose] : []),status,poseStatus);
   const parent = view.domElement.parentElement;
   parent?.appendChild(toolbar);
   for (const event of ['pointerdown','pointerup','click','dblclick','keydown'])
     toolbar.addEventListener(event, e => e.stopPropagation());
-  picker.addEventListener('change', () => select(picker.value));
+  picker.addEventListener('change', () => { restoreHandle = false; select(picker.value); });
   resetHandle.addEventListener('click', () => { if (selected?.kind === 'handle') pose?.reset(selected.handle); });
   resetPose.addEventListener('click', () => pose?.reset(null));
   toFrame.addEventListener('click', () => {
@@ -179,8 +196,8 @@ export function sceneSelection(view, node, initialTransforms = null) {
     syncMode();
   }
   modes.addEventListener('change', () => setMode(modes.value));
-  function select(id) {
-    if (pose && typeof id === 'string' && id.startsWith('h:') && pose.sphere(id.slice(2))) {
+  function select(id, persist = true) {
+    if (pose && poseState === 'ready' && typeof id === 'string' && id.startsWith('h:') && pose.sphere(id.slice(2))) {
       const h = id.slice(2);
       view.getGizmoManager().setupForModel(pose.sphere(h));
       view.setGizmoEnabled(true);
@@ -189,7 +206,7 @@ export function sceneSelection(view, node, initialTransforms = null) {
       toFrame.disabled = true;
       toFrame.style.opacity = '0.4';
       resetHandle.disabled = false; resetHandle.style.opacity = '1';
-      node.properties['3DA Selected Entity'] = id;
+      if (persist) node.properties['3DA Selected Entity'] = id;
       pose.highlight(h);
       view.setGizmoMode('translate');
       syncMode();
@@ -207,19 +224,31 @@ export function sceneSelection(view, node, initialTransforms = null) {
     picker.value = id;
     toFrame.disabled = !['prop','body'].includes(entity.kind);
     toFrame.style.opacity = toFrame.disabled ? '0.4' : '1';
-    node.properties['3DA Selected Entity'] = id;
+    if (persist) node.properties['3DA Selected Entity'] = id;
     syncMode();
     view.forceRender();
   }
   const pad = remotePad(view, setup, () => selected, () => gizmo.getMode(), () => {
     root.updateMatrixWorld(true); poseChange(); view.forceRender(); refresh(); });
   const savedSelection = node.properties['3DA Selected Entity'];
-  const known = entities.some(e => e.id === savedSelection) ||
-    (pose && typeof savedSelection === 'string' && savedSelection.startsWith('h:') && pose.sphere(savedSelection.slice(2)));
-  select(known ? savedSelection : entities[0].id);
+  let restoreHandle = pose && typeof savedSelection === 'string' && savedSelection.startsWith('h:') && pose.sphere(savedSelection.slice(2));
+  updatePoseUI = () => {
+    poseStatus.textContent = poseState === 'ready' ? '' : poseMessage;
+    poseStatus.style.display = poseState === 'ready' ? 'none' : '';
+    poseStatus.style.background = poseState === 'disabled' ? '#b71c1c' : '#37474f';
+    if (handleGroup) handleGroup.disabled = poseState !== 'ready';
+    resetPose.disabled = poseState !== 'ready';
+    if (poseState === 'disabled' && selected?.kind === 'handle') select(bodyEntity?.id ?? entities[0].id);
+    if (poseState === 'ready' && restoreHandle && selected?.id === entities[0].id) select(savedSelection);
+    if (poseState !== 'preparing') restoreHandle = false;
+  };
+  updatePoseUI();
+  const known = entities.some(e => e.id === savedSelection);
+  select(known ? savedSelection : entities[0].id, !restoreHandle);
   setMode(initialMode);
   diagnose();
   return { root, entities, capture, select, setMode, syncMode, selected: () => selected.id,
+    waitForEdits: () => pose?.waitForEdits(),
     setHandlesVisible: v => pose?.setVisible(v),
     dispose: () => {
       controls?.removeEventListener('mouseDown', beginScale);
