@@ -162,6 +162,10 @@ def add_support_depth(request, config, result):
         plate_dir = pack_cli.assets_for(config, pack_cli.location_id(profile.get("loc_id")), profile_path.parent)
         pf, _ = pack_cli.modules(config)
         plate = pf.Plate(plate_dir)
+        import manual_pose
+        basis = manual_pose.location_basis(plate)[:2, :2]
+        if np.isfinite(basis).all():
+            report["candidate_offset_basis_xy"] = basis.tolist()
         _, _, depths = plate.project(np.asarray([point[:3]], dtype=float))
         depth = float(depths[0])
         if np.isfinite(depth) and depth > 0:
@@ -171,11 +175,67 @@ def add_support_depth(request, config, result):
     return result
 
 
+def add_visual_metrics(config, result):
+    """Measure the actual saved render; failures stay explicit and do not invent proxy values."""
+    report = result.get('report') if isinstance(result, dict) else None
+    if not isinstance(report, dict):
+        return result
+    try:
+        import numpy as np
+        import manual_pose
+        directory = Path(result['silhouette']).parent
+        job = directory.parents[1]
+        joints = np.load(pack_cli.required_file(job / 'fit/label_joints.npz', 'fitted body joints'))['kp']
+        pelvis = (np.asarray(joints[9], dtype=float) + np.asarray(joints[10], dtype=float)) / 2
+        pf, _ = pack_cli.modules(config)
+        plate = pf.Plate(result['scene_setup']['plate_dir'])
+        basis = manual_pose.location_basis(plate)[:2, :2]
+        report['candidate_pelvis_xy'] = pelvis[:2].tolist()
+        report['candidate_offset_basis_xy'] = basis.tolist()
+    except Exception as exc:
+        report['placement_metrics_error'] = f'{type(exc).__name__}: {exc}'
+    if not result.get('silhouette'):
+        report.setdefault('visual_metrics_error', 'silhouette output unavailable')
+        return result
+    try:
+        import candidates
+        import threeda_blender
+        cfg = candidates.load_config()['visibility']
+        directory = Path(result['silhouette']).parent
+        scene = pack_cli.required_file(directory / 'scene.blend', 'candidate render scene')
+        import numpy as np
+        from PIL import Image
+        from candidate_visual import measure
+        output = directory / 'candidate_visual_metrics.json'
+        full = directory / 'candidate_visual_body.png'
+        visible = directory / 'candidate_visual_visible.png'
+        for path in (output, full, visible):
+            path.unlink(missing_ok=True)
+        pack_cli.run_stage(threeda_blender.command(config, HERE / 'candidate_visual_blender.py', [
+            '--scene', scene, '--out', output, '--expand', cfg['canvas_expansion']]),
+            'candidate silhouette passes')
+        with Image.open(pack_cli.required_file(full, 'body silhouette')) as image:
+            body = np.asarray(image.convert('L'))
+        with Image.open(pack_cli.required_file(visible, 'visible silhouette')) as image:
+            vis = np.asarray(image.convert('L'))
+        n = int(cfg['canvas_expansion'])
+        h, w = body.shape
+        if n < 3 or n % 2 != 1 or h % n or w % n:
+            raise ValueError('invalid expanded silhouette size')
+        height, width = h // n, w // n
+        x, y = (n - 1) * width // 2, (n - 1) * height // 2
+        report['visual_metrics'] = measure(body, vis, (x, y, x + width, y + height), cfg['mask_threshold'])
+    except Exception as exc:
+        report['visual_metrics_error'] = f'{type(exc).__name__}: {exc}'
+    return result
+
+
 def geometry_worker(request, config):
     captured = {}
     patch(request, config, captured)
     try:
-        return add_support_depth(request, config, pack_cli.do_place(request, config))
+        result = add_support_depth(request, config, pack_cli.do_place(request, config))
+        return add_visual_metrics(config, result)
     except Exception as exc:
         result = pack_cli.error_result(exc)
         if captured.get("report") is not None:

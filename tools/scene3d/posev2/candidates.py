@@ -344,20 +344,26 @@ def merge_ids(sid, objects, labels, cfg):
     return ",".join(ids) if len(ids) > 1 else None
 
 
-def principal_axis(cells):
-    """Основная горизонтальная ось поверхности и длина её следа; недостаточно данных — None."""
-    if not cells or len(cells) < 3:
+def principal_axis(cells, cfg):
+    """Ось, длина и центр опоры по заданным перцентилям её следа."""
+    if not cells or len(cells) < cfg['support_axis_min_points']:
         return None
     try:
         import numpy as np
         points = np.asarray(cells, float)[:, :2]
-        centered = points - points.mean(0)
+        if not np.isfinite(points).all():
+            return None
+        mean = points.mean(0)
+        centered = points - mean
         values, vectors = np.linalg.eigh(centered.T @ centered)
         axis = vectors[:, int(np.argmax(values))]
-        projection = centered @ axis
-        length = float(np.percentile(projection, 98) - np.percentile(projection, 2))
-        return [float(axis[0]), float(axis[1])], length
-    except (ImportError, ValueError):
+        side = np.array([-axis[1], axis[0]])
+        lo, hi = cfg['support_axis_percentiles']
+        along = np.percentile(centered @ axis, [lo, hi])
+        across = np.percentile(centered @ side, [lo, hi])
+        center = mean + axis * along.mean() + side * across.mean()
+        return axis.tolist(), float(along[1] - along[0]), center.tolist()
+    except (ImportError, ValueError, np.linalg.LinAlgError):
         return None
 
 
@@ -421,9 +427,9 @@ def _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contac
              "floor_id": None}
         c.update(kw)
         if support:
-            axis = principal_axis(_cells(objects_by_id.get(support["id"], {})))
+            axis = principal_axis(_cells(objects_by_id.get(support["id"], {})), cfg)
             if axis:
-                c["support_axis_xy"], c["support_length_m"] = axis
+                c["support_axis_xy"], c["support_length_m"], c["support_center_xy"] = axis
         if support and c["label"] not in ("floor", "auto"):
             c["merge_ids"] = merge_ids(support["id"], objects, labels, cfg)
             c["attempts"] = cfg["furniture_attempts"]
@@ -465,8 +471,10 @@ def _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contac
 
 
 def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
-    """Варианты по отчётам: разворот +180 у мебели, если отчёт видит сторону/спинку не так (в пределах n_max);
-    при room_scale_suspect — сверх n_max ещё лучший кандидат с height_m / room_scale."""
+    """Варианты по отчётам: разворот +180 у мебели (в пределах n_max); если все места плохи по
+    кадру/видимости — сдвиги на треть длины вдоль мировой оси опоры, преобразованные в базис камеры.
+    Центр вычисляется относительно таза после fit. Без геометрии — резервные сдвиги.
+    При room_scale_suspect — сверх n_max ещё лучший кандидат с height_m / room_scale."""
     extra = []
     for c, r in zip(cands, results):
         rep = (r or {}).get("report") or {}
@@ -477,25 +485,40 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
         if flags & set(cfg["flip_flags"]) or (isinstance(back, (int, float)) and back > cfg["back_gap_flip_cm"]):
             extra.append(dict(c, variant="yaw+180", body_dyaw=180.0, origin="derived"))
     out = extra[:max(0, n_max - len(cands))]
-    if cands and results:
-        frames = [(r or {}).get("report", {}).get("frame") or {} for r in results]
-        limits = cfg["frame"]
+    if cands and len(results) == len(cands):
         bad = []
-        for frame in frames:
-            box, size = frame.get("bbox_px"), frame.get("frame_px")
-            if not (isinstance(box, list) and len(box) == 4 and isinstance(size, list) and len(size) == 2 and size[1]):
-                continue
-            frac = max(0.0, float(box[3]) - float(box[1])) / float(size[1])
-            bottom_crop = box[3] > size[1] and frac < limits["closeup_height_frac"]
-            cropped = box[0] < 0 or box[2] > size[0] or box[1] < 0 or bottom_crop
-            bad.append(not frame.get("visible") or cropped or frac > limits["height_max_frac"] or
-                       frac < limits["height_min_frac"])
+        for result in results:
+            rep = (result or {}).get("report") or {}
+            height_score, crop_score = frame_components(rep, cfg)
+            visible = visibility_fraction(rep)
+            bad.append(height_score == 0.0 or crop_score == 0.0 or
+                       (visible is not None and visible < cfg["visibility"]["min_visible_frac"]))
         if bad and all(bad):
             base = best_cand or cands[0]
-            length = base.get("support_length_m")
-            shifts = ([(float(length) * fraction / 3, 0.0) for fraction in cfg["frame_shifts_thirds"]]
-                      if base.get("support_axis_xy") and isinstance(length, (int, float)) and length > 0
-                      else cfg["frame_shifts_m"])
+            shifts = cfg["frame_shifts_m"]
+            # Match the result to this exact fit, not another candidate on the same support.
+            base_index = next((i for i, c in enumerate(cands) if c is base), None)
+            if base_index is None:
+                base_index = next((i for i, c in enumerate(cands) if c == base), None)
+            rep = ((results[base_index] or {}).get('report') or {}) if base_index is not None else {}
+            try:
+                import numpy as np
+                axis = np.asarray(base.get("support_axis_xy"), dtype=float)
+                matrix = np.asarray(rep.get('candidate_offset_basis_xy'), dtype=float)
+                center = np.asarray(base.get('support_center_xy'), dtype=float)
+                pelvis = np.asarray(rep.get('candidate_pelvis_xy'), dtype=float)
+                length = float(base.get("support_length_m"))
+                if (axis.shape == (2,) and center.shape == (2,) and pelvis.shape == (2,)
+                        and matrix.shape == (2, 2) and np.isfinite(axis).all()
+                        and np.isfinite(center).all() and np.isfinite(pelvis).all()
+                        and np.isfinite(matrix).all() and math.isfinite(length) and length > 0
+                        and np.linalg.norm(axis) > 0):
+                    # The pelvis includes existing body offsets; add only the required delta.
+                    axis = axis / np.linalg.norm(axis)
+                    shifts = [np.linalg.solve(matrix, center + axis * length * fraction / 3 - pelvis).tolist()
+                              for fraction in cfg["frame_shifts_thirds"]]
+            except (TypeError, ValueError, np.linalg.LinAlgError):
+                pass  # Missing/invalid geometry: retain explicit camera-relative fallback shifts.
             for dx, dy in shifts:
                 out.append(dict(base, variant=f"frame_shift{dx:+g},{dy:+g}",
                                 body_dx=float(base.get("body_dx") or 0.0) + dx,
@@ -594,22 +617,13 @@ def score(cand, status, rep, pose_class, cfg):
     else:
         tier = (1.0, s["support_tier1"], s["support_tier2"])[rank[0]]
         comp["support_class"] = max(0.0, tier - rank[1] * s["support_step"])
-    frame = rep.get("frame") or {}
-    vis = visibility(frame, s, rep.get("keypoints_body25_px"))
-    comp["visibility"] = min(1.0, vis / cfg["visibility"]["min_visible_frac"])
-    box, size = frame.get("bbox_px"), frame.get("frame_px")
-    height_frac = None
-    crop = 0.0
-    if isinstance(box, list) and len(box) == 4 and isinstance(size, list) and len(size) == 2 and size[1] > 0:
-        height_frac = max(0.0, float(box[3]) - float(box[1])) / float(size[1])
-        limits = cfg["frame"]
-        lower_crop_allowed = box[3] > size[1] and height_frac >= limits["closeup_height_frac"]
-        cropped = box[0] < 0 or box[2] > size[0] or box[1] < 0 or (box[3] > size[1] and not lower_crop_allowed)
-        crop = 1.0 if cropped else 0.0
-    comp["frame_height"] = (1.0 if height_frac is None else
-                            0.0 if height_frac > cfg["frame"]["height_max_frac"] or
-                            height_frac < cfg["frame"]["height_min_frac"] else 1.0)
-    comp["crop"] = 1.0 - crop
+    vis = visibility_fraction(rep)
+    height, crop = frame_components(rep, cfg)
+    # Missing visual measurements are explicit and score below a verified candidate.
+    unknown = cfg['visual_unknown_score']
+    comp['visibility'] = min(1.0, vis / cfg['visibility']['min_visible_frac']) if vis is not None else unknown
+    comp['frame_height'] = height if height is not None else unknown
+    comp['crop'] = crop if crop is not None else unknown
     depth = rep.get("support_depth_m")
     comp["depth"] = (0.0 if isinstance(depth, (int, float)) and depth < cfg["depth"]["min_depth_m"]
                      else 1.0)
@@ -619,23 +633,22 @@ def score(cand, status, rep, pose_class, cfg):
     return round(value, 4), {k: round(v, 3) for k, v in comp.items()}
 
 
-def visibility(frame, s, keypoints=None):
-    """Прокси видимости: доля видимых 3DA ключевых точек (depth-tested), иначе доля bbox в кадре."""
-    if isinstance(keypoints, list):
-        values = [p[2] for p in keypoints[:25] if isinstance(p, list) and len(p) >= 3 and p[2] in (0, 1)]
-        if values:
-            return round(sum(values) / len(values), 3)
-    box, size = frame.get("bbox_px"), frame.get("frame_px")
-    if frame.get("ok"):
-        return 1.0
-    if not frame.get("visible"):
-        return 0.0
-    if not (isinstance(box, list) and len(box) == 4 and isinstance(size, list) and len(size) == 2):
-        return s["partly_visible"]
-    w, h = max(box[2] - box[0], 1e-6), max(box[3] - box[1], 1e-6)
-    iw = max(0.0, min(box[2], size[0]) - max(box[0], 0))
-    ih = max(0.0, min(box[3], size[1]) - max(box[1], 0))
-    return round(iw * ih / (w * h), 3)
+def visibility_fraction(rep):
+    value = (rep.get('visual_metrics') or {}).get('visible_fraction')
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) and 0 <= value <= 1 else None
+
+
+def frame_components(rep, cfg):
+    visual = rep.get('visual_metrics') or {}
+    height, edges = visual.get('height_fraction'), visual.get('cropped_edges')
+    if not isinstance(height, (int, float)) or not math.isfinite(height) or height < 0:
+        return None, None
+    if not isinstance(edges, list) or any(e not in ('left', 'right', 'top', 'bottom') for e in edges):
+        return None, None
+    limits = cfg['frame']
+    height_score = float(limits['height_min_frac'] <= height <= limits['height_max_frac'])
+    crop_score = float(not any(e != 'bottom' or height < limits['closeup_height_frac'] for e in edges))
+    return height_score, crop_score
 
 
 def actual_support(rep, cand, labels, objects):

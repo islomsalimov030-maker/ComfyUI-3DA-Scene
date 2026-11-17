@@ -114,7 +114,7 @@ def test_candidate_cli_adds_camera_depth(monkeypatch, tmp_path):
 
     class Plate:
         def __init__(self, path):
-            pass
+            self.R = np.array([[0., 0., -1.], [1., 0., 0.], [0., -1., 0.]])
 
         def project(self, points):
             return np.array([0.]), np.array([0.]), np.array([1.25])
@@ -130,23 +130,68 @@ def test_candidate_cli_adds_camera_depth(monkeypatch, tmp_path):
     result = {'report': {'target_instance': 'surf_1'}}
     assert CLI.add_support_depth({'location': 'profile'}, {}, result) is result
     assert result['report']['support_depth_m'] == 1.25
+    assert np.allclose(result['report']['candidate_offset_basis_xy'], [[0., -1.], [1., 0.]])
 
 
 def test_principal_axis_for_same_support_offsets():
-    result = C.principal_axis(cells(0, 0, 1.2, 0.3, .1))
+    result = C.principal_axis(cells(0, 0, 1.2, 0.3, .1), CFG)
     assert result is not None
-    axis, length = result
+    axis, length, center = result
     assert abs(abs(axis[0]) - 1.0) < 1e-6 and length > 1.0
+    assert np.allclose(center, [0.55, 0.1], atol=0.02)
 
 
 def test_derived_frame_shifts_require_bad_frame_evidence():
     cand = {'variant': 'support', 'support_id': 'surf_1', 'label': 'sofa', 'body_dx': 0., 'body_dy': 0.}
     missing = C.derived([cand], [{'report': {}}], CFG, 1, [], None, cand)
     assert missing == []
-    bad = {'frame': {'bbox_px': [0, 0, 900, 900], 'frame_px': [800, 800], 'visible': True}}
+    bad = {'visual_metrics': {'height_fraction': 1.125, 'cropped_edges': ['right', 'bottom']}}
     shifted = C.derived([cand], [{'report': bad}], CFG, 1, [], None, cand)
     assert len(shifted) == len(CFG['frame_shifts_m'])
     assert shifted[1]['support_id'] == 'surf_1' and shifted[1]['body_dx'] == CFG['frame_shifts_m'][1][0]
+
+
+def test_derived_rotated_support_centers_fitted_pelvis_and_shifts_thirds():
+    points = [[x - y, x + y] for x, y in cells(0, 0, 2.1, .3, .1)]
+    axis, length, center = C.principal_axis(points, CFG)
+    cand = {'variant': 'support', 'support_id': 'surf_1', 'label': 'sofa', 'body_dx': .2, 'body_dy': -.1,
+            'support_axis_xy': axis, 'support_length_m': length, 'support_center_xy': center}
+    basis = np.array([[0., -1.], [1., 0.]])
+    pelvis = np.array([0.4, -0.2])
+    bad = {'visual_metrics': {'visible_fraction': .3}, 'candidate_offset_basis_xy': basis.tolist(),
+           'candidate_pelvis_xy': pelvis.tolist()}
+    shifted = C.derived([cand], [{'report': bad}], CFG, 1, [], None, cand)
+    assert len(shifted) == len(CFG['frame_shifts_thirds'])
+    for entry, fraction in zip(shifted, CFG['frame_shifts_thirds']):
+        delta_camera = np.array([entry['body_dx'] - .2, entry['body_dy'] + .1])
+        world_result = pelvis + basis @ delta_camera
+        expected = np.array(center) + np.array(axis) * length * fraction / 3
+        assert np.allclose(world_result, expected)
+        assert entry['support_id'] == cand['support_id']
+    # Without exact fitted-pelvis/basis data, fallback remains camera-relative.
+    for invalid in (None, [[0., 0.], [0., 0.]], [[float('nan'), 0.], [0., 1.]]):
+        bad['candidate_offset_basis_xy'] = invalid
+        fallback = C.derived([cand], [{'report': bad}], CFG, 1, [], None, cand)
+        delta = [fallback[1]['body_dx'] - .2, fallback[1]['body_dy'] + .1]
+        assert np.allclose(delta, CFG['frame_shifts_m'][1])
+
+
+def test_derived_occlusion_only_and_all_candidates_requirement():
+    cand = {'variant': 'support', 'support_id': 'surf_1', 'label': 'sofa', 'body_dx': 0., 'body_dy': 0.,
+            'support_axis_xy': [0., 1.], 'support_length_m': 1.8}
+    frame = {'bbox_px': [100, 100, 400, 600], 'frame_px': [800, 800], 'visible': True, 'ok': True}
+    hidden = {'report': {'frame': frame, 'visual_metrics': {'visible_fraction': .3}}}
+    good = {'report': {'frame': frame, 'visual_metrics': {'visible_fraction': .8}}}
+    unknown = {'report': {'frame': frame}}
+    shifted = C.derived([cand], [hidden], CFG, 1, [], None, cand)
+    assert len(shifted) == len(CFG['frame_shifts_m'])
+    assert np.allclose([shifted[1]['body_dx'], shifted[1]['body_dy']], CFG['frame_shifts_m'][1])
+    assert C.derived([cand, cand], [hidden, hidden], CFG, 2, [], None, cand)
+    assert C.derived([cand, cand], [hidden, good], CFG, 2, [], None, cand) == []
+    assert C.derived([cand, cand], [hidden, unknown], CFG, 2, [], None, cand) == []
+    assert C.derived([cand, cand], [hidden], CFG, 2, [], None, cand) == []
+    threshold = {'report': {'visual_metrics': {'visible_fraction': CFG['visibility']['min_visible_frac']}}}
+    assert C.derived([cand], [threshold], CFG, 1, [], None, cand) == []
 
 
 def rep(status, gap=1.0, pen=1.0, frame_ok=True):
@@ -166,21 +211,23 @@ def test_score_ranking_and_pick():
     assert s_bed < s_ok                                   # та же постановка, но опора ниже в списке класса
     assert set(comp) == {'status', 'gap', 'penetration', 'pose_match', 'support_class', 'visibility',
                          'frame_height', 'crop', 'depth'}
-    _, oversized = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
-                            'bbox_px': [100, -10, 300, 760], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
+    def visual(height, edges, visible=1.0):
+        return {**rep('ok'), 'visual_metrics': {'height_fraction': height, 'cropped_edges': edges,
+                                                'visible_fraction': visible}}
+    _, oversized = C.score(sofa, 'ok', visual(.96, ['top']), 'sit_edge', CFG)
     assert oversized['frame_height'] == 0.0 and oversized['crop'] == 0.0
-    _, closeup = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
-                           'bbox_px': [100, 100, 300, 790], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
+    _, closeup = C.score(sofa, 'ok', visual(.86, []), 'sit_edge', CFG)
     assert closeup['frame_height'] == 0.0 and closeup['crop'] == 1.0
-    _, lower_edge = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
-                              'bbox_px': [100, 100, 300, 900], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
-    assert lower_edge['crop'] == 1.0                 # нижний край допустим на крупном плане
-    _, small_bottom_crop = C.score(sofa, 'ok', {**rep('ok'), 'frame': {'ok': False, 'visible': True,
-                                   'bbox_px': [100, 600, 300, 820], 'frame_px': [800, 800]}}, 'sit_edge', CFG)
-    assert small_bottom_crop['crop'] == 0.0          # на среднем плане обрезание штрафуется
-    occluded = [[0., 0., 1]] * 3 + [[0., 0., 0]] * 7
-    _, mostly_hidden = C.score(sofa, 'ok', {**rep('ok'), 'keypoints_body25_px': occluded}, 'sit_edge', CFG)
+    _, lower_edge = C.score(sofa, 'ok', visual(1.0, ['bottom']), 'sit_edge', CFG)
+    assert lower_edge['crop'] == 1.0
+    _, small_bottom_crop = C.score(sofa, 'ok', visual(.3, ['bottom']), 'sit_edge', CFG)
+    assert small_bottom_crop['crop'] == 0.0
+    _, mostly_hidden = C.score(sofa, 'ok', visual(.5, [], .3), 'sit_edge', CFG)
     assert mostly_hidden['visibility'] == 0.5
+    _, unknown_visual = C.score(sofa, 'ok', rep('ok'), 'sit_edge', CFG)
+    assert unknown_visual['visibility'] == CFG['visual_unknown_score']
+    assert unknown_visual['frame_height'] == CFG['visual_unknown_score']
+    assert unknown_visual['crop'] == CFG['visual_unknown_score']
     _, shallow = C.score(sofa, 'ok', {**rep('ok'), 'support_depth_m': 1.2}, 'sit_edge', CFG)
     assert shallow['depth'] == 0.0
     entries = [{'index': 0, 'score': .4}, {'index': 1, 'score': .9}, {'index': 2, 'score': .9}, {'index': 3, 'score': None}]
@@ -457,10 +504,8 @@ def test_low_long_narrow_is_bench():
 
 
 def test_visibility_and_yaw_penalty():
-    s = CFG['score']
-    assert C.visibility({'ok': True}, s) == 1.0 and C.visibility({'ok': False, 'visible': False}, s) == 0.0
-    part = {'ok': False, 'visible': True, 'bbox_px': [100, 600, 300, 1000], 'frame_px': [1344, 768]}
-    assert abs(C.visibility(part, s) - 0.42) < 1e-3                          # видно 168 из 400 px по высоте
+    assert C.visibility_fraction({'visual_metrics': {'visible_fraction': .42}}) == .42
+    assert C.visibility_fraction({'frame': {'ok': True}, 'keypoints_body25_px': [[0, 0, 1]]}) is None
     base, _ = C.score({'label': 'floor'}, 'ok', rep('ok'), 'stand', CFG)
     turned, _ = C.score({'label': 'floor', 'body_dyaw': 25.0}, 'ok', rep('ok'), 'stand', CFG)
     assert turned < base                                                      # тот же отчёт, но отход от референса
