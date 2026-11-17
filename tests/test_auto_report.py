@@ -104,7 +104,7 @@ def test_nodes_phase_driver_order(roots):
     for phase in (1, 2):
         for i in range(rows_count):
             row = Nd.AutoRow().execute(batch_json, i, phase)['result']
-            images, n_images, prompt, mc, mf, mp, rid, skip = row[:5], *row[5:]
+            images, n_images, prompt, mc, mf, mp, rid, skip = row[:5], *row[5:12]
             assert all(tuple(im.shape[1:]) in ((12, 16, 3), (64, 64, 3)) for im in images)
             if skip:
                 continue
@@ -117,7 +117,7 @@ def test_nodes_phase_driver_order(roots):
     assert order == [(1, '001'), (1, '002'), (2, '001'), (2, '002')]
     # строка с ошибкой: чёрные 64×64 вместо отсутствующего фото, skip
     row = Nd.AutoRow().execute(batch_json, 2, 1)['result']
-    assert row[-1] is True and tuple(row[1].shape) == (1, 64, 64, 3) and row[5] == 1
+    assert row[11] is True and tuple(row[1].shape) == (1, 64, 64, 3) and row[5] == 1
     # повтор той же задачи — пропуск, файлы не трогаются
     assert 'пропуск' in Nd.AutoSave().execute(batch_json, 0, 1, text='x')['result'][0]
     rep = Nd.AutoReport().execute(batch_json)
@@ -128,4 +128,4 @@ def test_nodes_phase_driver_order(roots):
     assert sorted(S.load(out_dir)['rows']['001']['phase_done']) == ['1', '2']
     # пакет без строк/без имени — текст на узле, без исключения
     assert Nd.AutoBatch().execute('', '1')['result'][1] == 0
-    assert Nd.AutoRow().execute('{"error": "x"}', 0, 1)['result'][-1] is True
+    assert Nd.AutoRow().execute('{"error": "x"}', 0, 1)['result'][11] is True

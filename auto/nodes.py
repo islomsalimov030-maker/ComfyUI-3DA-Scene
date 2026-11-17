@@ -16,6 +16,7 @@ from . import state as state_mod
 from . import store
 from . import report as report_mod
 from .vision import VisionPick
+from . import parse as parse_mod
 
 CATEGORY = '3DA/auto'
 N = batch_mod.N_PHOTOS
@@ -44,6 +45,20 @@ def load_image(path):
 
 def digest(*parts):
     return hashlib.sha1(json.dumps(parts, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()
+
+
+HINT_PHASE = 1   # E5: фаза разбора промпта — её текст (hint_json) «строка» отдаёт в следующих фазах
+
+
+def saved_text(out_dir, row_state, phase):
+    """Текст, сохранённый узлом «сохранить» для фазы строки (`p<фаза>_text.txt` из state.json); нет — ''."""
+    try:
+        for rel in (row_state or {}).get('files', {}).get(str(phase), []):
+            if rel.endswith(f'p{phase}_text.txt'):
+                return (Path(out_dir) / rel).read_text(encoding='utf-8')
+    except OSError:
+        pass
+    return ''
 
 
 def batch_data(value):
@@ -106,9 +121,10 @@ class AutoRow:
             'batch': ('STRING', {'forceInput': True}),
             'row_index': ('INT', {'default': 0, 'min': 0, 'max': 100000, 'tooltip': 'Номер строки с 0 (ставит драйвер фаз)'}),
             'phase': ('INT', {'default': 1, 'min': 1, 'max': 99, 'tooltip': 'Фаза (ставит драйвер фаз)'})}}
-    RETURN_TYPES = ('IMAGE',) * N + ('INT', 'STRING', 'STRING', 'STRING', 'STRING', 'STRING', 'BOOLEAN')
+    # E5: hint_json — в конце (старые выходы не сдвигаются)
+    RETURN_TYPES = ('IMAGE',) * N + ('INT', 'STRING', 'STRING', 'STRING', 'STRING', 'STRING', 'BOOLEAN', 'STRING')
     RETURN_NAMES = tuple(f'image{k}' for k in range(1, N + 1)) + (
-        'n_images', 'prompt', 'mod_character', 'mod_face', 'mod_prop', 'row_id', 'skip')
+        'n_images', 'prompt', 'mod_character', 'mod_face', 'mod_prop', 'row_id', 'skip', 'hint_json')
     FUNCTION = 'execute'
     CATEGORY = CATEGORY
 
@@ -122,13 +138,14 @@ class AutoRow:
             return digest('error', str(exc))
 
     def execute(self, batch, row_index, phase):
-        images, notes, row, skip, present = [blank() for _ in range(N)], [], None, True, []
+        images, notes, row, skip, present, hint = [blank() for _ in range(N)], [], None, True, [], ''
         try:
             data, st = batch_data(batch)
             if not 0 <= row_index < len(data['rows']):
                 raise IndexError(f'строки {row_index} нет: в пакете {len(data["rows"])} строк')
             row = data['rows'][row_index]
             skip = state_mod.skip(st['rows'].get(row['row_id']), phase)
+            hint = saved_text(data['out_dir'], st['rows'].get(row['row_id']), HINT_PHASE)
             for k, path in enumerate(row['photos']):
                 if not path:
                     continue
@@ -148,7 +165,7 @@ class AutoRow:
                 + (' · ПРОПУСК' if skip else '') + ''.join(f'\n{n}' for n in notes))
         return {'ui': {'text': [text]},
                 'result': (*images, n_images, (row or {}).get('prompt', ''), mods.get('character', ''),
-                           mods.get('face', ''), mods.get('prop', ''), rid, bool(skip))}
+                           mods.get('face', ''), mods.get('prop', ''), rid, bool(skip), hint)}
 
 
 class AutoSave:
@@ -242,8 +259,25 @@ class AutoReport:
         return {'ui': {'text': [text], 'zip': [zip_path]}, 'result': (text, zip_path)}
 
 
+class ParseHint:
+    """E5: ответ LLM о позе → hint_json для 3DAPlaceCandidates; битый ответ — запасной разбор по словам промпта."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {'required': {'text': ('STRING', {'forceInput': True, 'tooltip': 'Ответ модели (JSON, можно в ```-блоке)'})},
+                'optional': {'prompt': ('STRING', {'forceInput': True, 'tooltip': 'Исходный промпт строки — для запасного разбора'})}}
+    RETURN_TYPES = ('STRING', 'BOOLEAN', 'STRING')
+    RETURN_NAMES = ('hint_json', 'ok', 'note')
+    FUNCTION = 'execute'
+    CATEGORY = CATEGORY
+    OUTPUT_NODE = True
+
+    def execute(self, text, prompt=''):
+        hint, ok, note = parse_mod.safe_parse(text, prompt)
+        return {'ui': {'text': [hint + '\n' + note]}, 'result': (hint, ok, note)}
+
+
 NODE_CLASS_MAPPINGS = {'3DAAutoBatch': AutoBatch, '3DAAutoRow': AutoRow, '3DAAutoSave': AutoSave, '3DAAutoReport': AutoReport,
-                       '3DAVisionPick': VisionPick}
+                       '3DAVisionPick': VisionPick, '3DAParseHint': ParseHint}
 NODE_DISPLAY_NAME_MAPPINGS = {'3DAAutoBatch': '3DA · пакет: загрузка', '3DAAutoRow': '3DA · пакет: строка',
                               '3DAAutoSave': '3DA · пакет: сохранить', '3DAAutoReport': '3DA · пакет: отчёт',
-                              '3DAVisionPick': '3DA · выбор кандидата (зрение)'}
+                              '3DAVisionPick': '3DA · выбор кандидата (зрение)', '3DAParseHint': '3DA · разбор промпта'}

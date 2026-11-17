@@ -415,3 +415,82 @@ passport:
     nightstand: top
     shelf: top
   defer_baseline: true        # с паспортом запасной «пол» для сидя ставится, только если мебель не дала тела
+
+# E5: узел 3DAParseHint (auto/parse.py) — разбор ответа LLM в подсказку постановки hint_json
+# {"pose_class","support","facing","near_wall","prop"} для 3DAPlaceCandidates. Старые узлы этот раздел не читают.
+parse_hint:
+  pose_classes: [stand, kneel, sit_edge, sit_tucked, sit_floor, crouch, recline, lie, all_fours]  # = CLASSES в nodes.py без auto
+  facing_values: [camera, away, side]
+  default: {pose_class: stand, support: floor, facing: camera, near_wall: false, prop: ''}   # нечего разобрать вовсе
+  floor_classes: [stand, kneel, crouch, all_fours]   # запасной разбор: у этих классов опора — пол…
+  floor_words: [floor, mat, rug]                    # …кроме упомянутого в промпте коврика
+  support_max_words: 3        # опора не из словаря — первые слова ответа модели, не больше стольких
+  prop_max_words: 3
+  aliases:                    # ответ модели (нижний регистр, пробел/дефис → _) → допустимое значение
+    pose_class: {standing: stand, stands: stand, leaning: stand, kneeling: kneel, kneels: kneel, on_knees: kneel,
+                 sitting: sit_edge, sit: sit_edge, seated: sit_edge, sit_on_edge: sit_edge, sitting_tucked: sit_tucked,
+                 sit_on_floor: sit_floor, sitting_on_floor: sit_floor, squat: crouch, squatting: crouch, crouching: crouch,
+                 reclining: recline, reclined: recline, half_lying: recline, lying: lie, lies: lie, lying_down: lie,
+                 prone: lie, supine: lie, on_all_fours: all_fours, hands_and_knees: all_fours, all_four: all_fours}
+    facing: {front: camera, forward: camera, viewer: camera, towards_camera: camera, toward_camera: camera, facing_camera: camera,
+             back: away, behind: away, backwards: away, back_to_camera: away, rear: away,
+             profile: side, sideways: side, left: side, right: side, three_quarter: side}
+  support_words:              # фраза опоры → слово подсказки (как в candidates.synonyms); длинные фразы ищутся раньше
+    massage table: massage_table
+    massage_table: massage_table
+    treatment table: massage_table
+    weight bench: bench
+    gym bench: bench
+    workout bench: bench
+    bench: bench
+    exercise mat: mat
+    yoga mat: mat
+    gym mat: mat
+    mat: mat
+    rug: rug
+    carpet: rug
+    floor: floor
+    ground: floor
+    mattress: bed
+    bed: bed
+    sofa: sofa
+    couch: couch
+    loveseat: loveseat
+    armchair: armchair
+    chair: chair
+    stool: stool
+    ottoman: ottoman
+    pouf: ottoman
+    desk: desk
+    counter: counter
+    table: table
+    windowsill: windowsill
+    frame: frame
+    machine: frame
+  keywords:                   # запасной разбор по исходному промпту (нижний регистр): регулярные выражения,
+                              # первое правило с совпадением по порядку списка
+    pose_class:
+      - {value: all_fours, any: ['\ball fours\b', '\bhands and knees\b']}
+      - {value: kneel, any: ['\bknee(l|ls|ling|lt)\b', '\bon (her|his|their|the) knees\b']}
+      - {value: crouch, any: ['\bsquat(s|ting)?\b', '\bcrouch(es|ing)?\b']}
+      - {value: recline, any: ['\bpropped (up )?on (a |the )?(raised )?(pillow|pillows|cushion|cushions|backrest|elbows)\b',
+                               '\brecline[sd]?\b', '\breclining\b', '\bhalf[- ]lying\b', '\bsit[- ]?ups?\b', '\bcrunch(es)?\b',
+                               '\blean(s|ing)? back on (her|his|their) elbows\b']}
+      - {value: lie, any: ['\bl(ie|ies|ying|ays)\b']}
+      - {value: sit_floor, any: ['\bsit(s|ting)?\b[^.]*\bon the (floor|ground|mat|exercise mat|yoga mat|rug|carpet)\b',
+                                 '\bcross[- ]legged on the (floor|ground|mat|rug|carpet)\b']}
+      - {value: sit_tucked, any: ['\b(knee|knees|leg|legs) (pulled|tucked|drawn) up\b', '\b(foot|feet) on the (sofa|couch|bed|bench|chair|seat)\b',
+                                  '\bcross[- ]legged\b', '\blegs tucked\b', '\bsit(s|ting)?\b[^.]*\bon the bed\b']}
+      - {value: sit_edge, any: ['\bsit(s|ting)?\b', '\bseated\b', '\bperche[sd]\b']}
+      - {value: stand, any: ['\bstand(s|ing)?\b', '\blean(s|ing)?\b']}
+    facing:
+      - {value: away, any: ['\bback (half[- ])?turned\b', '\bback to the (camera|viewer)\b', '\bfrom behind\b', '\bfacing away\b',
+                            '\bturned away\b']}
+      - {value: side, any: ['\bin profile\b', '\bseen from the side\b', '\bsideways\b']}   # «lies on her side» — не разворот
+      - {value: camera, any: ['\bfacing the (camera|viewer)\b', '\bat the camera\b', '\btowards? the camera\b']}
+    near_wall:
+      - {value: true, any: ['\bagainst the\b', '\bleans? (her|his|their) back\b', '\btouching the (wall|mirror)\b',
+                            '\bin front of the mirror\b', '\bat the (stove|bookshelf|shelf|wall|counter|sink|window)\b',
+                            '\bagainst (a|the) wall\b']}
+    prop:                     # первая группа регулярного выражения — предмет в руках
+      - '\b(?:holding|holds|hold|reading|squeezing|wiping|carrying|lifting|pressing|stirring)\s+(?:(?:a|an|the|her|his|their|small|big|large|some|both)\s+)*([a-z]+(?:\s+(?!(?:with|in|at|on|around|over|under|to|up|and|from|by|behind|for|of|while)\b)[a-z]+)?)'
