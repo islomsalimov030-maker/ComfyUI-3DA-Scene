@@ -1773,7 +1773,9 @@ class PlaceCandidates:
         timeout = float(cfg['cli_timeout_s'])
 
         def run_one(index, c):
-            pose = CandidatePose(timeout, {'e1_zone_min_frac': c['zone_min_frac']} if c.get('zone_min_frac') else None)
+            extra = {'e1_zone_min_frac': c.get('zone_min_frac'), 'e1_floor_id': c.get('floor_id'),
+                     'e1_merge_ids': c.get('merge_ids')}
+            pose = CandidatePose(timeout, {k: v for k, v in extra.items() if v})
             outs = pose.execute(location, pose_ref, pc, c['target_object'], support_parts, c['secondary_contacts'],
                                 c['instance_hint'], c['height_m'], body_json, proxy, strength, seed, block_on_fail,
                                 c['body_dx'], c['body_dy'], 0., c['body_dyaw'], 0., 0., pose_text, props,
@@ -1786,7 +1788,8 @@ class PlaceCandidates:
             value, comp = cm.score(c, st, rep if st != 'fallback' else {}, pc, cfg)
             entry = {'index': index, **{k: c.get(k) for k in ('variant', 'target_object', 'instance_hint', 'support_id',
                                                               'label', 'secondary_contacts', 'body_dx', 'body_dy',
-                                                              'body_dyaw', 'height_m', 'zone_min_frac')},
+                                                              'body_dyaw', 'height_m', 'zone_min_frac', 'floor_id',
+                                                              'merge_ids')},
                      'geometry': labels.get(c['support_id'] or '', {}).get('features'),
                      'status': st, 'place_status': place_status,
                      'support_object': cm.actual_support(rep, c, labels, objs) if st != 'fallback' else 'other',

@@ -189,13 +189,12 @@ def classify(objects, cfg):
                         back = o["id"]
                         break
         L, W = ext if ext else (None, None)
-        # маленький верх на высоте сиденья или стола — тумба (табурет по геометрии от неё не отличить)
-        if area < g["small_top_max_area_m2"] and top <= g["table_h"][1]:
-            label = "nightstand"
-        elif seat_h is not None and L is not None and L >= g["bed_min_l_m"] and W >= g["bed_min_w_m"]:
+        if seat_h is not None and L is not None and L >= g["bed_min_l_m"] and W >= g["bed_min_w_m"]:
             label = "bed"
         elif seat_h is not None and back is not None:
-            label = "sofa"
+            label = "sofa"                          # сиденье + спинка: и маленький видимый кусок сиденья — диван
+        elif area < g["small_top_max_area_m2"] and top <= g["table_h"][1]:
+            label = "nightstand"                    # маленький верх без спинки — тумба (табурет от неё не отличить)
         elif seat_h is not None:
             label = "bench"
         elif top <= g["table_h"][1]:
@@ -307,16 +306,45 @@ def room_scale(objects, labels, cfg):
     return round(med, 3), flags
 
 
+def floor_choice(objects, labels):
+    """None — у профиля свой пол (floor_1); иначе id самого большого куска на уровне пола (для e1_floor_id)."""
+    if any(o.get("type") == "floor" and labels.get(o["id"], {}).get("label") == "floor" for o in objects):
+        return None
+    floors = [o for o in objects if labels.get(o["id"], {}).get("label") == "floor"]
+    return max(floors, key=lambda o: (float(o.get("area_m2") or 0.0), o["id"]))["id"] if floors else None
+
+
+def merge_ids(sid, objects, labels, cfg):
+    """Куски той же группы мебели с высотой в пределах geometry.merge_dh_m от опоры: «sid,…» для e1_merge_ids;
+    один кусок — None."""
+    group = (labels.get(sid, {}).get("features") or {}).get("group_ids") or []
+    by_id = {o["id"]: o for o in objects}
+    h = _h(by_id.get(sid, {}))
+    if h is None:
+        return None
+    ids = [sid] + [i for i in group if i != sid and i in by_id and _h(by_id[i]) is not None
+                   and abs(_h(by_id[i]) - h) <= cfg["geometry"]["merge_dh_m"]]
+    return ",".join(ids) if len(ids) > 1 else None
+
+
 # ------------------------------------------------------------------------------------------------ план
 def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts=""):
     """Начальный список кандидатов (до n). Производные варианты (разворот +180, рост/масштаб) добавляет
     derived() по отчётам прогонов."""
+    floor_id = floor_choice(objects, labels)
+
     def cand(variant, support, **kw):
         c = {"variant": variant, "target_object": support["type"] if support else "floor",
              "instance_hint": support["id"] if support else "", "support_id": support["id"] if support else None,
              "label": support["label"] if support else "floor", "secondary_contacts": secondary_contacts,
-             "body_dx": 0.0, "body_dy": 0.0, "body_dyaw": 0.0, "height_m": float(height_m)}
+             "body_dx": 0.0, "body_dy": 0.0, "body_dyaw": 0.0, "height_m": float(height_m), "floor_id": None}
         c.update(kw)
+        if support and c["label"] not in ("floor", "auto"):
+            c["merge_ids"] = merge_ids(support["id"], objects, labels, cfg)
+        if c["label"] == "floor" and c["target_object"] != "auto":
+            # пол — всегда штатный target «floor»; без своего пола у профиля — выбранный кусок (e1_floor_id)
+            c.update(target_object="floor", instance_hint="", floor_id=floor_id,
+                     support_id=floor_id or c["support_id"])
         return c
     out = []
     if pose_class == "auto":
@@ -324,14 +352,7 @@ def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts
         return [cand("auto", None, target_object="floor", instance_hint="", label="auto")]
     sups = supports_for(pose_class, objects, labels, hint, cfg)
     if pose_class == "stand":
-        floor = next((s for s in sups if s["type"] == "floor"), None)
-        base = floor or (sups[0] if sups else None)
-        if base is not None and base["type"] == "floor":
-            out.append(cand("floor", base, target_object="floor", instance_hint=""))
-        elif base is not None:
-            out.append(cand("floor", base))
-        else:
-            out.append(cand("floor", None))
+        out.append(cand("floor", sups[0] if sups else None))
         if hint.get("near_wall") and out:
             wall = ",".join(p + ":wall" for p in cfg["wall_parts"])
             sec = ",".join(x for x in (secondary_contacts, wall) if x)
@@ -346,10 +367,7 @@ def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts
     for s in sups:
         if len(out) >= room:
             break
-        if s["type"] == "floor" and s["id"] == "floor_1":
-            out.append(cand("support", s, target_object="floor", instance_hint=""))
-        else:
-            out.append(cand("support", s))
+        out.append(cand("support", s))
     if not any(c["label"] == "floor" for c in out) and len(out) < n:
         # запасной вариант — штатная постановка 3DA на пол (как базовый замер): лучше wrong_surface, чем fallback
         out.append(cand("baseline", None, target_object="floor", instance_hint="", label="floor"))
@@ -424,7 +442,9 @@ def score(cand, status, rep, pose_class, cfg):
             dev += abs(_wrap(ang["plate"] - ang["ref"]))
     elif isinstance(rep.get("reference_pose_error_m"), (int, float)):
         dev = rep["reference_pose_error_m"] * s["ref_error_deg_per_m"]
-    comp["pose_match"] = math.exp(-dev / s["pose_scale_deg"]) if dev is not None else s["pose_unknown"]
+    yaw = abs(_wrap(float(cand.get("body_dyaw") or 0.0)))     # ручной поворот отчёт не пересчитывает в ракурсе
+    comp["pose_match"] = (math.exp(-(dev + yaw) / s["pose_scale_deg"]) if dev is not None else
+                          s["pose_unknown"] * math.exp(-yaw / s["pose_scale_deg"]))
     rank = support_rank(pose_class, cand.get("label", "floor"), cfg) if pose_class != "auto" else None
     if pose_class == "auto":
         comp["support_class"] = s["support_unknown"]
@@ -432,12 +452,26 @@ def score(cand, status, rep, pose_class, cfg):
         comp["support_class"] = 0.0
     else:
         comp["support_class"] = max(0.0, (1.0 if rank[0] == 0 else s["support_tier1"]) - rank[1] * s["support_step"])
-    frame = rep.get("frame") or {}
-    comp["visibility"] = 1.0 if frame.get("ok") else (s["partly_visible"] if frame.get("visible") else 0.0)
+    comp["visibility"] = visibility(rep.get("frame") or {}, s)
     total_w = sum(w.values())
     # без постановки (fallback, no_target) итог 0: верная метка опоры не делает пустой вариант лучше реального
     value = sum(w[k] * comp[k] for k in w) / total_w if total_w and comp["status"] > 0 else 0.0
     return round(value, 4), {k: round(v, 3) for k, v in comp.items()}
+
+
+def visibility(frame, s):
+    """Доля рамки тела (bbox_px) внутри кадра (frame_px); нет рамки — по флагам ok/visible."""
+    box, size = frame.get("bbox_px"), frame.get("frame_px")
+    if frame.get("ok"):
+        return 1.0
+    if not frame.get("visible"):
+        return 0.0
+    if not (isinstance(box, list) and len(box) == 4 and isinstance(size, list) and len(size) == 2):
+        return s["partly_visible"]
+    w, h = max(box[2] - box[0], 1e-6), max(box[3] - box[1], 1e-6)
+    iw = max(0.0, min(box[2], size[0]) - max(box[0], 0))
+    ih = max(0.0, min(box[3], size[1]) - max(box[1], 0))
+    return round(iw * ih / (w * h), 3)
 
 
 def actual_support(rep, cand, labels, objects):

@@ -296,8 +296,106 @@ def test_node_no_target_report_and_retry(monkeypatch):
     assert out[5].startswith('status=fallback') and len(out) == 12
     assert all(s[0].endswith('candidates_cli.py') and s[3] == CFG['cli_timeout_s'] and s[4] is False for s in seen)
     # диван, диван+мягкая зона, кровать, кровать+мягкая зона, запасной «пол» (пол без повтора)
-    assert [(s[1], s[2]) for s in seen] == [('surf_1', None), ('surf_1', .5), ('surf_4', None), ('surf_4', .5), ('', None)]
+    z = CFG['zone_relax_frac']
+    assert [(s[1], s[2]) for s in seen] == [('surf_1', None), ('surf_1', z), ('surf_4', None), ('surf_4', z), ('', None)]
     summary = json.loads(out[10])
     assert summary['candidates'][0]['place_status'] == 'no_target'
     assert summary['candidates'][0]['zone']['zone_mask_area_m2'] == 0.2
     assert N.PlacePose().runner.__func__ is N.PlacePose.runner                 # у старого узла — прежний invoke
+
+
+def test_small_seat_with_back_is_sofa_not_nightstand():
+    # виден только средний кусок сиденья дивана (0.17 м²) и верх спинки — это диван, не тумба
+    objs = [{'id': 'floor_1', 'type': 'floor', 'height_m': 0.0, 'area_m2': 3.0, 'cells_xy': cells(-2, -2, 2, 0, .25)},
+            {'id': 'surf_4', 'type': 'other', 'height_m': 0.49, 'area_m2': 0.17, 'cells_xy': cells(0, 1, .45, 1.4)},
+            {'id': 'surf_5', 'type': 'other', 'height_m': 0.93, 'area_m2': 0.42, 'cells_xy': cells(-1, 1.6, 1.4, 1.8)}]
+    lab = labels_of(objs)
+    assert lab['surf_4'] == 'sofa' and lab['surf_5'] == 'backrest'
+
+
+def test_floor_choice_without_profile_floor():
+    objs = [{'id': 'surf_1', 'type': 'other', 'height_m': -0.05, 'area_m2': 0.7},
+            {'id': 'surf_2', 'type': 'other', 'height_m': 0.01, 'area_m2': 6.4},
+            {'id': 'surf_3', 'type': 'other', 'height_m': 0.52, 'area_m2': 1.0}]
+    lab = C.classify(objs, CFG)
+    assert C.floor_choice(objs, lab) == 'surf_2'
+    stand = C.plan('stand', objs, lab, {}, 1, CFG, 2.30)[0]
+    assert (stand['target_object'], stand['instance_hint'], stand['floor_id']) == ('floor', '', 'surf_2')
+    sit = C.plan('sit_edge', objs, lab, {}, 4, CFG, 2.30)
+    assert sit[-1]['variant'] == 'baseline' and sit[-1]['floor_id'] == 'surf_2'
+    assert C.floor_choice(room(), C.classify(room(), CFG)) is None          # свой floor_1 — штатно
+
+
+def test_visibility_and_yaw_penalty():
+    s = CFG['score']
+    assert C.visibility({'ok': True}, s) == 1.0 and C.visibility({'ok': False, 'visible': False}, s) == 0.0
+    part = {'ok': False, 'visible': True, 'bbox_px': [100, 600, 300, 1000], 'frame_px': [1344, 768]}
+    assert abs(C.visibility(part, s) - 0.42) < 1e-3                          # видно 168 из 400 px по высоте
+    base, _ = C.score({'label': 'floor'}, 'ok', rep('ok'), 'stand', CFG)
+    turned, _ = C.score({'label': 'floor', 'body_dyaw': 25.0}, 'ok', rep('ok'), 'stand', CFG)
+    assert turned < base                                                      # тот же отчёт, но отход от референса
+
+
+def test_cli_floor_id(monkeypatch, tmp_path):
+    import candidates_cli as cc
+    import manual_pose
+    import profiles
+    for mod, name in ((profiles.LocationProfile, '__init__'), (manual_pose, 'placement_key')):
+        monkeypatch.setattr(mod, name, getattr(mod, name))
+    import place
+    import reference_place
+    monkeypatch.setattr(place, 'place', place.place)
+    monkeypatch.setattr(reference_place, 'place', reference_place.place)
+    monkeypatch.setattr(manual_pose, 'placement_key', lambda *a, **k: 'abc')
+    data = {'loc_id': 'x', 'version': 2, 'reviewed': False, 'scale': {}, 'anchors': [], 'substitutes': {},
+            'auto_surfaces': {'floor_status': 'floor_ambiguous'},
+            'objects': [{'id': 'surf_1', 'name': 'other', 'type': 'other', 'top_grid_npz': 'a.npz'},
+                        {'id': 'surf_2', 'name': 'other', 'type': 'other', 'top_grid_npz': 'b.npz'}]}
+    (tmp_path / 'profile.json').write_text(json.dumps(data), encoding='utf-8')
+    cc.patch({'e1_floor_id': 'surf_2'}, {'farm_root': '.', 'comfy': '.'}, {})
+    prof = profiles.LocationProfile(tmp_path / 'profile.json')
+    assert [o['type'] for o in prof.data['objects']] == ['other', 'floor']
+    assert prof.data['auto_surfaces']['floor_status'] == 'ok'
+    assert prof.find_object('floor')[0]['id'] == 'surf_2'
+    assert manual_pose.placement_key() != 'abc'
+
+
+def test_merge_ids_for_bed_pieces():
+    objs = room()
+    lab = C.classify(objs, CFG)
+    assert C.merge_ids('surf_4', objs, lab, CFG) == 'surf_4,surf_5'          # 0.52 и 0.55 — одна кровать
+    assert C.merge_ids('surf_1', objs, lab, CFG) is None                      # спинка 0.92 — не та высота
+    sit = C.plan('sit_edge', objs, lab, {}, 4, CFG, 2.30)
+    assert sit[1]['merge_ids'] == 'surf_4,surf_5' and sit[0].get('merge_ids') is None
+
+
+def test_cli_merge_support(monkeypatch, tmp_path):
+    import candidates_cli as cc
+    import manual_pose
+    import place
+    import profiles
+    import reference_place
+    import top_region as tr
+    for mod, name in ((profiles.LocationProfile, '__init__'), (profiles.LocationProfile, 'region'),
+                      (place, 'match_auto_support'), (place, 'place'), (reference_place, 'place'),
+                      (manual_pose, 'placement_key')):
+        monkeypatch.setattr(mod, name, getattr(mod, name))
+    shape, origin = (40, 40), np.array([0.0, 0.0])
+    objects = []
+    for k, (rows, h) in enumerate(((slice(0, 20), .52), (slice(20, 40), .55), (slice(0, 5), .29)), 1):
+        mask = np.zeros(shape, bool)
+        mask[rows, 5:35] = True
+        reg = tr.TopRegion('other', 'auto', origin, shape, np.where(mask, h, np.nan), mask, np.zeros(shape), h, (1, 6),
+                           np.zeros(2), object_mask=mask.copy())
+        tr.save_npz(reg, tmp_path / f'surf_{k}_top.npz')
+        objects.append({'id': f'surf_{k}', 'name': 'other', 'type': 'other', 'top_grid_npz': f'surf_{k}_top.npz'})
+    data = {'loc_id': 'x', 'version': 2, 'reviewed': False, 'scale': {}, 'anchors': [], 'substitutes': {},
+            'objects': objects}
+    (tmp_path / 'profile.json').write_text(json.dumps(data), encoding='utf-8')
+    cc.patch({'e1_merge_ids': 'surf_2,surf_1'}, {'farm_root': '.', 'comfy': '.'}, {})
+    prof = profiles.LocationProfile(tmp_path / 'profile.json')
+    assert [o['id'] for o in prof.data['objects']] == ['surf_2', 'surf_3']   # surf_1 влит в surf_2
+    reg = prof.region(prof.data['objects'][0])
+    assert reg.mask.sum() == 40 * 30 and reg.object_id == 'surf_2' and abs(reg.h0 - .535) < .02
+    assert place.match_auto_support(None, reg, 2.3)[0] is None               # не перевыбирать один кусок
+    assert prof.region(prof.data['objects'][1]).mask.sum() == 5 * 30          # чужие куски — как были
