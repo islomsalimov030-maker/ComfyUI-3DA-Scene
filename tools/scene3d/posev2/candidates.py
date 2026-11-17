@@ -266,8 +266,9 @@ def matches_word(label, word, cfg):
     return bool(w) and (w == label or w in cfg["synonyms"].get(label, []))
 
 
-def supports_for(pose_class, objects, labels, hint, cfg):
-    """Подходящие опоры по порядку: подсказка → ярус/номер класса → площадь (больше — раньше) → id."""
+def supports_for(pose_class, objects, labels, hint, cfg, include_spare=False):
+    """Подходящие опоры по порядку: подсказка → ярус/номер класса → площадь (больше — раньше) → id.
+    include_spare (E6, variant_set 2) — запасные fallback_only не отбрасываются и при другой мебели."""
     found = []
     for o in objects:
         if o.get("type") == "wall" or _h(o) is None:
@@ -280,7 +281,7 @@ def supports_for(pose_class, objects, labels, hint, cfg):
                                                  str(hint["support"]).lower() == o["id"])
         found.append({"id": o["id"], "type": o.get("type", "other"), "label": label, "rank": list(rank),
                       "hinted": hinted, "area_m2": o.get("area_m2")})
-    if any(s["rank"][0] < 2 and s["label"] != "floor" for s in found):
+    if not include_spare and any(s["rank"][0] < 2 and s["label"] != "floor" for s in found):
         found = [s for s in found if s["rank"][0] < 2]          # запасные (fallback_only) — только без другой мебели
     found.sort(key=lambda s: (not s["hinted"], s["rank"], -(s["area_m2"] or 0.0), s["id"]))
     # одна опора на группу мебели (куски одной кровати — один вариант места)
@@ -360,9 +361,36 @@ def floor_merge_ids(floor_id, objects, labels, cfg):
 
 
 # ------------------------------------------------------------------------------------------------ план
-def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts=""):
+def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts="", variant_set=0):
     """Начальный список кандидатов (до n). Производные варианты (разворот +180, рост/масштаб) добавляет
-    derived() по отчётам прогонов."""
+    derived() по отчётам прогонов.
+    E6, variant_set (когда зрение забраковало все кандидаты набора 0): 1 — те же места с другими разворотами
+    (cfg.variant_sets.yaws_deg); 2 — соседние опоры (не вошедшие в набор 0, включая запасные), затем соседние места
+    лучшего места набора 0 (cfg.variant_sets.shifts_m). 0 — как раньше."""
+    base = _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts)
+    if not variant_set or not base:
+        return base
+    vs = cfg["variant_sets"]
+    if int(variant_set) == 1:
+        heads = [c for c in base if not str(c["variant"]).startswith("yaw")]
+        return [dict(c, variant=f"{c['variant']}|yaw{y:+g}", body_dyaw=float(y))
+                for y in vs["yaws_deg"] for c in heads][:n]
+    used = {c.get("support_id") for c in base}
+    floor_used = any(c["label"] == "floor" for c in base)
+    out = []
+    if pose_class != "auto":
+        for s in supports_for(pose_class, objects, labels, hint, cfg, include_spare=True):
+            if s["id"] in used or (s["label"] == "floor" and floor_used):
+                continue
+            out += _plan0(pose_class, objects, labels, hint, 1, cfg, height_m, secondary_contacts, only_support=s)
+    out += [dict(base[0], variant=f"{base[0]['variant']}|shift{dx:+g},{dy:+g}", body_dx=float(dx), body_dy=float(dy))
+            for dx, dy in vs["shifts_m"]]
+    return out[:n]
+
+
+def _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts="", only_support=None):
+    """Набор 0 (E1): опоры по классу и подсказке, «как сейчас» на полу, развороты стоя.
+    only_support (E6) — один кандидат на эту опору (variant «neighbor»)."""
     floor_id = floor_choice(objects, labels)
 
     def cand(variant, support, **kw):
@@ -382,6 +410,8 @@ def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts
                      merge_ids=None if pose_class in cfg["floor_merge_skip"] else
                      floor_merge_ids(floor_id, objects, labels, cfg))
         return c
+    if only_support is not None:
+        return [cand("neighbor", only_support)]
     out = []
     if pose_class == "auto":
         # 3DA не определяет класс сам (reference_place: pose_class_inferred=False): один штатный прогон.

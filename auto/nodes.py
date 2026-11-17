@@ -15,6 +15,7 @@ from . import batch as batch_mod
 from . import state as state_mod
 from . import store
 from . import report as report_mod
+from .vision import VisionPick
 
 CATEGORY = '3DA/auto'
 N = batch_mod.N_PHOTOS
@@ -241,6 +242,8 @@ class AutoReport:
         return {'ui': {'text': [text], 'zip': [zip_path]}, 'result': (text, zip_path)}
 
 
-NODE_CLASS_MAPPINGS = {'3DAAutoBatch': AutoBatch, '3DAAutoRow': AutoRow, '3DAAutoSave': AutoSave, '3DAAutoReport': AutoReport}
+NODE_CLASS_MAPPINGS = {'3DAAutoBatch': AutoBatch, '3DAAutoRow': AutoRow, '3DAAutoSave': AutoSave, '3DAAutoReport': AutoReport,
+                       '3DAVisionPick': VisionPick}
 NODE_DISPLAY_NAME_MAPPINGS = {'3DAAutoBatch': '3DA · пакет: загрузка', '3DAAutoRow': '3DA · пакет: строка',
-                              '3DAAutoSave': '3DA · пакет: сохранить', '3DAAutoReport': '3DA · пакет: отчёт'}
+                              '3DAAutoSave': '3DA · пакет: сохранить', '3DAAutoReport': '3DA · пакет: отчёт',
+                              '3DAVisionPick': '3DA · выбор кандидата (зрение)'}

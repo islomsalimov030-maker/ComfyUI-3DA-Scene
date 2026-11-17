@@ -1726,6 +1726,9 @@ class PlaceCandidates:
         optional = dict(base['optional'])
         optional['hint_json'] = ('STRING', {'default': '', 'multiline': True,
                                             'tooltip': '{"support":"sofa","facing":"camera","near_wall":true}; пусто — без подсказки'})
+        optional['variant_set'] = ('INT', {'default': 0, 'min': 0, 'max': 2,
+                                           'tooltip': '0 — как сейчас; 1 — другие развороты; 2 — соседние опоры и места '
+                                                      '(повтор, когда зрение забраковало все кандидаты)'})
         return {'required': required, 'optional': optional}
     RETURN_TYPES = PlacePose.RETURN_TYPES + ('STRING', 'IMAGE')
     RETURN_NAMES = PlacePose.RETURN_NAMES + ('candidates_json', 'contact_sheet')
@@ -1734,11 +1737,11 @@ class PlaceCandidates:
 
     def execute(self, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
                 strength, seed, objects, n_candidates=4, pick=-1, block_on_fail=False, hint_json='', pose_text='',
-                props='[]', body_transform='', megapixels=0., settings=None):
+                props='[]', body_transform='', megapixels=0., settings=None, variant_set=0):
         try:
             return self.run(location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json,
                             proxy, strength, seed, objects, n_candidates, pick, block_on_fail, hint_json, pose_text,
-                            props, body_transform, megapixels, settings)
+                            props, body_transform, megapixels, settings, variant_set)
         except Exception as exc:
             out = fallback_outputs('кандидаты: ' + short_reason(exc), error_text(exc))
             return out + (json.dumps({'error': short_reason(exc), 'candidates': []}, ensure_ascii=False),
@@ -1746,7 +1749,7 @@ class PlaceCandidates:
 
     def run(self, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
             strength, seed, objects, n_candidates, pick, block_on_fail, hint_json, pose_text, props, body_transform,
-            megapixels, settings):
+            megapixels, settings, variant_set=0):
         t0 = time.monotonic()
         upstream = error_payload(location) or error_payload(body_transform)
         if upstream is not None:
@@ -1754,6 +1757,20 @@ class PlaceCandidates:
             return out + (json.dumps({'error': upstream, 'candidates': []}, ensure_ascii=False), out[0])
         cm = candidates_helpers()
         cfg = cm.load_config()
+        variant_set = max(0, min(int(variant_set or 0), 2))
+        cache, cache_note = None, 'off'
+        try:
+            cache = self.cache_for(cfg, location, pose_ref, pose_class, support_parts, secondary_contacts, height_m,
+                                   body_json, proxy, strength, seed, objects, n_candidates, block_on_fail, hint_json,
+                                   pose_text, props, body_transform, megapixels, settings, variant_set)
+            stored = cache.summary() if cache is not None else None
+            if stored is not None:
+                chosen = cm.choose(stored['candidates'], pick)
+                if chosen is not None:
+                    outs, rep = cache.candidate(chosen['index'])
+                    return self.finish(chosen, outs, rep, stored, pick, t0, cache.sheet(), 'hit')
+        except Exception as exc:  # noqa: BLE001 — кэш не мешает узлу: считаем заново
+            print(f'[3DA] кэш кандидатов не прочитан: {short_reason(exc)}')
         hint = cm.parse_hint(hint_json)
         n = max(1, min(int(n_candidates), 8))
         pc = pose_class
@@ -1768,7 +1785,14 @@ class PlaceCandidates:
         objs = cm.enrich(cm.parse_objects(objects), profile, profile_dir, cfg)
         labels = cm.classify(objs, cfg)
         scale, scale_flags = cm.room_scale(objs, labels, cfg)
-        cands = cm.plan(pc, objs, labels, hint, n, cfg, height_m, secondary_contacts)
+        cands = cm.plan(pc, objs, labels, hint, n, cfg, height_m, secondary_contacts, variant_set)
+        if cache is not None:
+            try:
+                cache.begin()
+                cache_note = 'miss'
+            except Exception as exc:  # noqa: BLE001
+                print(f'[3DA] кэш кандидатов не записан: {short_reason(exc)}')
+                cache = None
         entries, best, picked, tiles, ran = [], None, None, [], []
         timeout = float(cfg['cli_timeout_s'])
 
@@ -1818,6 +1842,13 @@ class PlaceCandidates:
             outs, rep, entry, caption = run_one(index, c)
             entries.append(entry)
             ran.append((c, entry, rep))
+            if cache is not None:
+                try:
+                    cache.put(index, outs, rep)
+                except Exception as exc:  # noqa: BLE001
+                    print(f'[3DA] кэш кандидатов не записан: {short_reason(exc)}')
+                    cache.abort()
+                    cache, cache_note = None, 'off'
             tiles.append((outs[0], caption))
             # держим выходы только лучшего по оценке и выбранного pick (память: по 10 тензоров на кандидата)
             if best is None or entry['score'] > best[0]['score']:
@@ -1834,12 +1865,31 @@ class PlaceCandidates:
                 queue = cm.derived([c0 for c0, _ in first_run], [{'report': r0} for _, r0 in first_run], cfg, n,
                                    scale_flags, scale, best_cand=ran[top][0])
         if best is None:
+            if cache is not None:
+                cache.abort()
             raise RuntimeError('ни один кандидат не выполнен')
         entry, outs, rep = picked if picked is not None else best
+        stored = {'pose_class': pc, 'hint': hint, 'room_scale': scale, 'room_flags': list(scale_flags),
+                  'variant_set': variant_set, 'limit_s': limit, 'computed_seconds': round(time.monotonic() - t0, 1),
+                  'labels': {k: {'label': v['label'], **(v.get('features') or {})} for k, v in labels.items()},
+                  'candidates': entries}
+        sheet = contact_sheet(tiles)
+        if cache is not None:
+            try:
+                cache.commit(stored, sheet)
+            except Exception as exc:  # noqa: BLE001
+                print(f'[3DA] кэш кандидатов не записан: {short_reason(exc)}')
+                cache.abort()
+                cache_note = 'off'
+        return self.finish(entry, outs, rep, stored, pick, t0, sheet, cache_note)
+
+    @staticmethod
+    def finish(entry, outs, rep, stored, pick, t0, sheet, cache_note):
+        """Выходы узла по выбранному кандидату; stored — всё, что не зависит от pick (оно же лежит в кэше)."""
+        entries, flags, limit = stored['candidates'], list(stored['room_flags']), float(stored['limit_s'])
         first, _, _ = outs[5].partition('\n')
         notes = [f"кандидат {entry['index']}/{len(entries)} ({entry['support_object']}, {entry['variant']}), "
                  f"оценка {entry['score']:.2f}"]
-        flags = list(scale_flags)
         if flags:
             notes.append('масштаб комнаты: ' + ', '.join(flags))
         if any(e['status'] == 'skipped_time' for e in entries):
@@ -1847,14 +1897,45 @@ class PlaceCandidates:
         status = first + ' | ' + '; '.join(notes) + '\n' + json.dumps({
             'status': entry['status'], 'support_object': entry['support_object'],
             'support_gap_cm': entry['support_gap_cm'], 'max_penetration_cm': entry['max_penetration_cm'],
-            'candidate_index': entry['index'], 'score': entry['score'], 'pose_class': pc, 'flags': flags,
-            'room_scale': scale, 'report': rep}, ensure_ascii=False)
-        summary = {'pose_class': pc, 'hint': hint, 'room_scale': scale, 'room_flags': flags,
+            'candidate_index': entry['index'], 'score': entry['score'], 'pose_class': stored['pose_class'],
+            'flags': flags, 'room_scale': stored['room_scale'], 'report': rep}, ensure_ascii=False)
+        summary = {'pose_class': stored['pose_class'], 'hint': stored['hint'], 'room_scale': stored['room_scale'],
+                   'room_flags': flags, 'variant_set': stored.get('variant_set', 0),
                    'chosen': entry['index'], 'pick': pick, 'seconds': round(time.monotonic() - t0, 1),
-                   'labels': {k: {'label': v['label'], **(v.get('features') or {})} for k, v in labels.items()},
-                   'candidates': entries}
-        return outs[:5] + (status,) + outs[6:] + (json.dumps(summary, ensure_ascii=False, default=str),
-                                                  contact_sheet(tiles))
+                   'cache': cache_note, 'computed_seconds': stored.get('computed_seconds'),
+                   'labels': stored['labels'], 'candidates': entries}
+        return tuple(outs[:5]) + (status,) + tuple(outs[6:]) + (json.dumps(summary, ensure_ascii=False, default=str),
+                                                                sheet)
+
+    def cache_for(self, cfg, location, pose_ref, *fields):
+        """E6: кэш кандидатов по хэшу входов без pick (файлы локации/кода/настроек — отпечаток 3DAPlacePose).
+        None — кэш выключен (нет farm_root и THREEDA_CAND_CACHE)."""
+        import hashlib
+        import importlib.util
+        root = os.environ.get('THREEDA_CAND_CACHE') or ''
+        if not root:
+            farm = config().get('farm_root')
+            root = str(Path(farm) / 'cand_cache') if farm else ''
+        if not root:
+            return None
+        (pose_class, support_parts, secondary_contacts, height_m, body_json, proxy, strength, seed, objects,
+         n_candidates, block_on_fail, hint_json, pose_text, props, body_transform, megapixels, settings,
+         variant_set) = fields
+        h = hashlib.sha256()
+        h.update(PlacePose.fingerprint(location, props, body_json=body_json).encode('utf-8'))
+        ref = pose_ref.detach().cpu().float().numpy() if hasattr(pose_ref, 'detach') else np.asarray(pose_ref)
+        h.update(str(ref.shape).encode('utf-8'))
+        h.update(np.ascontiguousarray(ref).tobytes())
+        h.update(json.dumps([str(location), pose_class, support_parts, secondary_contacts, height_m, body_json, proxy,
+                             strength, seed, objects, n_candidates, block_on_fail, hint_json, pose_text, props,
+                             body_transform, megapixels, settings, variant_set],
+                            ensure_ascii=False, sort_keys=True, default=str).encode('utf-8'))
+        spec = importlib.util.spec_from_file_location('three_da_cand_cache', HERE / 'auto' / 'cand_cache.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        h.update(mod.VERSION.encode('utf-8'))
+        c = cfg['cache']
+        return mod.CandCache(root, h.hexdigest()[:32], c['keep'], c['tmp_age_s'])
 
 
 NODE_CLASS_MAPPINGS = {'3DAControl': Control, '3DABodyProfile': BodyProfile, '3DABodyMeasure': BodyMeasure, '3DALocation': Location, '3DAPlacePose': PlacePose, '3DAProp': Prop, '3DAH3Remote': H3Remote,
