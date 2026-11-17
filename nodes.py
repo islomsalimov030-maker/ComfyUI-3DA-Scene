@@ -1776,9 +1776,10 @@ class PlaceCandidates:
             extra = {'e1_zone_min_frac': c.get('zone_min_frac'), 'e1_floor_id': c.get('floor_id'),
                      'e1_merge_ids': c.get('merge_ids'), 'e1_attempts': c.get('attempts')}
             pose = CandidatePose(timeout, {k: v for k, v in extra.items() if v})
-            outs = pose.execute(location, pose_ref, pc, c['target_object'], support_parts, c['secondary_contacts'],
-                                c['instance_hint'], c['height_m'], body_json, proxy, strength, seed, block_on_fail,
-                                c['body_dx'], c['body_dy'], 0., c['body_dyaw'], 0., 0., pose_text, props,
+            outs = pose.execute(location, pose_ref, pc, c['target_object'], c.get('support_parts') or support_parts,
+                                c['secondary_contacts'], c['instance_hint'], c['height_m'], body_json, proxy, strength,
+                                seed, block_on_fail, c['body_dx'], c['body_dy'], c.get('body_dz', 0.), c['body_dyaw'],
+                                0., 0., pose_text, props,
                                 body_transform, megapixels, settings)
             st, rep = cm.report_of(outs[5])
             place_status = rep.get('status') if rep else None
@@ -1787,9 +1788,9 @@ class PlaceCandidates:
                 rep, place_status = pose.last['report'], pose.last.get('place_status')
             value, comp = cm.score(c, st, rep if st != 'fallback' else {}, pc, cfg)
             entry = {'index': index, **{k: c.get(k) for k in ('variant', 'target_object', 'instance_hint', 'support_id',
-                                                              'label', 'secondary_contacts', 'body_dx', 'body_dy',
-                                                              'body_dyaw', 'height_m', 'zone_min_frac', 'floor_id',
-                                                              'merge_ids', 'attempts')},
+                                                              'label', 'secondary_contacts', 'support_parts', 'body_dx',
+                                                              'body_dy', 'body_dz', 'body_dyaw', 'height_m',
+                                                              'zone_min_frac', 'floor_id', 'merge_ids', 'attempts')},
                      'geometry': labels.get(c['support_id'] or '', {}).get('features'),
                      'status': st, 'place_status': place_status,
                      'support_object': cm.actual_support(rep, c, labels, objs) if st != 'fallback' else 'other',
@@ -1797,7 +1798,8 @@ class PlaceCandidates:
                      'flags': rep.get('flags'), 'zone': (rep.get('zone_diagnostics') or {}) if st == 'fallback' else None,
                      'error': outs[5].partition('\n')[0][:200] if st == 'fallback' else None,
                      'score': value, 'components': comp, 'seconds': round(time.monotonic() - started, 1)}
-            caption = f"#{index} {c['support_id'] or c['target_object']} {c['label']} yaw{c['body_dyaw']:+g} {st} {value:.2f}"
+            dz = f" dz{c['body_dz']:+.2f}" if c.get('body_dz') else ''
+            caption = f"#{index} {c['support_id'] or c['target_object']} {c['label']} yaw{c['body_dyaw']:+g}{dz} {st} {value:.2f}"
             return outs, rep, entry, caption
 
         limit = float(cfg['max_seconds'])
@@ -1824,7 +1826,7 @@ class PlaceCandidates:
                 picked = (entry, outs, rep)
             index += 1
             # no_target по zone_too_small — сразу тот же вариант с мягкой зоной (место того же кандидата)
-            queue[:0] = cm.retries(c, entry['place_status'], entry['flags'], cfg)
+            queue[:0] = cm.retries(c, entry['place_status'], entry['flags'], cfg, entry['status'], rep, pc)
             if not queue and not derived_done:
                 derived_done = True
                 first_run = [(c0, r0) for c0, e0, r0 in ran if c0.get('origin') is None]

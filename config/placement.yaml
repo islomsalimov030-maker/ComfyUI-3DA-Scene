@@ -303,6 +303,17 @@ candidates:
   furniture_attempts: 2       # ячеек зоны на одну мебельную опору (штатно place.attempts = 5): опоры перебирают кандидаты
   zone_relax_frac: 0.4        # no_target по zone_too_small → повтор: маска опоры ≥ 0.4 × след тела (штатно 1.0);
                               # след таза и бёдер 2.3-метрового тела ~0.39 м², видимый кусок сиденья дивана бывает 0.17 м²
+  zone_relax_support_parts:   # в том же повторе — опорные части по классу (штатно pack_cli.DEFAULT_SUPPORT):
+    sit_edge: [pelvis]        # бёдра над невидимой частью сиденья не «висят» — там просто нет маски
+    sit_tucked: [pelvis]
+    lie: [pelvis, torso]
+  settle:                     # тело над опорой (wrong_surface/contact_fail по зазору) → то же место ниже на body_dz
+    statuses: [wrong_surface, contact_fail]
+    target_m: 0.02            # дальняя опорная часть (медиана зазора) — до 2 см (часть «на опоре» при ≤ place.on_surf_m 4 см)
+    sink_m: 0.02              # ближняя часть уходит в опору не больше 2 см (жёсткий допуск place.pen_hard_m 3 см)
+    max_m: 0.08               # больше — это не «чуть выше», а другая постановка
+    min_m: 0.005
+    rounds: 2                 # повторов на кандидата (каждый — постановка из кэша и проверка, секунды)
   floor_band_m: 0.12          # |высота − пол| ≤ этого — уровень пола (обрывки пола surf_N, коврик)
   max_cells: 1500             # подвыборка ячеек маски поверхности для расстояний между кусками
   extent_percentiles: [2, 98] # длина/ширина следа группы по главным осям
@@ -316,7 +327,9 @@ candidates:
     bed_min_l_m: 1.60         # след группы ≥ 1.6 × 1.0 м при высоте сиденья — кровать
     bed_min_w_m: 1.00
     bench_min_len_m: 0.90     # верх на высоте сиденья длиннее — скамья, даже если узкий и маленький по площади
-    small_top_max_area_m2: 0.35   # верх меньше (на высоте сиденья или стола) — тумба; табурет по геометрии не отличить
+    small_top_max_area_m2: 0.35   # верх меньше (на высоте сиденья или стола) — тумба/табурет
+    small_seat_max_h_m: 0.60  # маленький верх не выше этого (и в seat_h) — «seat»: табурет, пуф, край скамьи за кадром;
+                              # выше — тумба (0.73–0.75 в наборе); опора сидя только без другой мебели (fallback_only)
     table_h: [0.25, 1.05]     # верх стола/тумбы/массажного стола
   synonyms:                   # слова для подсказки hint_json.support и для таблицы классов
     floor: [mat, rug, ground]
@@ -325,15 +338,16 @@ candidates:
     bench: [seat, chair, ottoman, massage_table]
     table: [desk, massage_table, counter]
     nightstand: [cabinet, dresser, side_table]
+    seat: [stool, ottoman, pouf]
     shelf: []
     backrest: []              # верх спинки дивана — не опора
   support_by_class:           # опоры по классу позы в порядке приоритета; deny — не годятся
     sit_edge: {allowed: [sofa, couch, armchair, chair, bench, bed, stool, ottoman, massage_table],
-               deny: [nightstand, cabinet, dresser, shelf, table, desk, floor]}
+               deny: [nightstand, cabinet, dresser, shelf, table, desk, floor], fallback_only: [seat]}
     sit_tucked: {allowed: [sofa, couch, armchair, chair, bench, bed, stool, ottoman, massage_table],
-                 deny: [nightstand, cabinet, dresser, shelf, table, desk, floor]}
-    recline: {allowed: [bed, sofa, couch, bench, massage_table, mat, floor], deny: [nightstand, shelf, stool]}
-    lie: {allowed: [bed, sofa, couch, bench, massage_table, mat, floor], deny: [nightstand, shelf, stool]}
+                 deny: [nightstand, cabinet, dresser, shelf, table, desk, floor], fallback_only: [seat]}
+    recline: {allowed: [bed, sofa, couch, bench, massage_table, mat, floor], deny: [nightstand, shelf, stool, seat]}
+    lie: {allowed: [bed, sofa, couch, bench, massage_table, mat, floor], deny: [nightstand, shelf, stool, seat]}
     kneel: {allowed: [floor, mat], deny: []}
     crouch: {allowed: [floor, mat], deny: []}
     sit_floor: {allowed: [floor, mat], deny: []}
@@ -370,5 +384,6 @@ candidates:
     pose_unknown: 0.5
     support_unknown: 0.5
     support_tier1: 0.6        # опора годится только по синониму (стол → массажный стол)
+    support_tier2: 0.4        # запасная опора fallback_only (маленькое «сиденье»)
     support_step: 0.05        # минус за каждую позицию в списке класса
     partly_visible: 0.5

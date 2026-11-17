@@ -25,7 +25,7 @@ def room():
         {'id': 'floor_1', 'type': 'floor', 'height_m': 0.0, 'area_m2': 8.0, 'cells_xy': cells(-2, -2, 2, 2, .25)},
         {'id': 'surf_1', 'type': 'other', 'height_m': 0.47, 'area_m2': 0.9, 'cells_xy': cells(0, 1, 1.8, 1.5)},
         {'id': 'surf_2', 'type': 'other', 'height_m': 0.92, 'area_m2': 0.3, 'cells_xy': cells(0, 1.9, 1.8, 2.1)},
-        {'id': 'surf_3', 'type': 'other', 'height_m': 0.60, 'area_m2': 0.2, 'cells_xy': cells(-1.5, 1, -1.1, 1.4)},
+        {'id': 'surf_3', 'type': 'other', 'height_m': 0.72, 'area_m2': 0.2, 'cells_xy': cells(-1.5, 1, -1.1, 1.4)},
         {'id': 'surf_4', 'type': 'other', 'height_m': 0.52, 'area_m2': 1.2, 'cells_xy': cells(-3, -3, -2.2, -1.5)},
         {'id': 'surf_5', 'type': 'other', 'height_m': 0.55, 'area_m2': 1.2, 'cells_xy': cells(-2.2, -3, -1.4, -1.5)},
         {'id': 'wall_1', 'type': 'wall', 'height_m': 2.4},
@@ -41,7 +41,7 @@ def test_geometry_labels():
     assert lab['floor_1'] == 'floor'
     assert lab['surf_1'] == 'sofa'          # сиденье + более высокий кусок рядом (спинка)
     assert lab['surf_2'] == 'backrest'      # верх спинки — не опора
-    assert lab['surf_3'] == 'nightstand'    # маленький верх 0.6 м
+    assert lab['surf_3'] == 'nightstand'    # маленький верх 0.72 м (выше сиденья)
     assert lab['surf_4'] == lab['surf_5'] == 'bed'   # два куска одной кровати → одна группа 1.6 × 1.5 м
     assert 'wall_1' not in lab
 
@@ -239,6 +239,57 @@ def test_retries_zone_relax_once():
     assert C.retries(sofa, 'no_target', ['other_flag'], CFG) == []
     assert C.retries(dict(sofa, label='floor'), 'no_target', ['zone_too_small'], CFG) == []
     assert C.score(sofa, 'fallback', {}, 'sit_edge', CFG)[0] == 0.0            # пустой вариант — 0
+    # с классом позы — и опорные части из zone_relax_support_parts
+    out = C.retries(sofa, 'no_target', ['zone_too_small'], CFG, 'fallback', {}, 'sit_edge')
+    assert out[0]['support_parts'] == ','.join(CFG['zone_relax_support_parts']['sit_edge'])
+    assert 'support_parts' not in C.retries(sofa, 'no_target', ['zone_too_small'], CFG, 'fallback', {}, 'recline')[0]
+
+
+def test_small_seat_fallback_only():
+    """Маленький верх на высоте сиденья — «seat»: опора сидя только если другой мебели нет; лёжа — нет."""
+    seat = {'id': 'surf_9', 'type': 'other', 'height_m': 0.55, 'area_m2': 0.16, 'cells_xy': cells(3, 3, 3.5, 3.4)}
+    tall = {'id': 'surf_8', 'type': 'other', 'height_m': 0.73, 'area_m2': 0.18, 'cells_xy': cells(-3, 3, -2.5, 3.4)}
+    floor = room()[0]
+    objs = [floor, seat, tall]
+    lab = C.classify(objs, CFG)
+    assert lab['surf_9']['label'] == 'seat' and lab['surf_8']['label'] == 'nightstand'
+    assert [s['id'] for s in C.supports_for('sit_edge', objs, lab, {}, CFG)] == ['surf_9']
+    assert C.supports_for('lie', objs, lab, {}, CFG)[0]['label'] == 'floor'
+    assert all(s['label'] != 'seat' for s in C.supports_for('lie', objs, lab, {}, CFG))
+    objs = room() + [seat]                                   # есть диван/кровать — «seat» не нужен
+    lab = C.classify(objs, CFG)
+    assert all(s['label'] != 'seat' for s in C.supports_for('sit_edge', objs, lab, {}, CFG))
+    c = {'label': 'seat', 'body_dyaw': 0.0}
+    assert C.score(c, 'ok', {}, 'sit_edge', CFG)[1]['support_class'] == CFG['score']['support_tier2']
+
+
+def sup_rep(*gaps_cm):
+    return {'contacts': {f'p{i}': {'role': 'support', 'gap_cm': g} for i, g in enumerate(gaps_cm)} |
+            {'foot.L': {'role': 'secondary', 'gap_cm': 30.0}}}
+
+
+def test_settle_offset():
+    s = CFG['settle']
+    # тело над сиденьем на 4.3–4.6 см: дальняя часть — до target_m
+    assert abs(C.settle_offset('wrong_surface', sup_rep(4.6, 4.3, 4.4), CFG) + (0.046 - s['target_m'])) < 1e-6
+    # ближняя часть почти на опоре — сдвиг ограничен sink_m
+    assert abs(C.settle_offset('contact_fail', sup_rep(0.5, 9.0), CFG) + (0.005 + s['sink_m'])) < 1e-6
+    assert C.settle_offset('contact_fail', sup_rep(30.0, 30.0), CFG) == -s['max_m']
+    assert C.settle_offset('ok', sup_rep(4.6), CFG) is None                     # статус и так годный
+    assert C.settle_offset('wrong_surface', sup_rep(-1.0, 3.0), CFG) is None    # уже в опоре — не опускать
+    assert C.settle_offset('wrong_surface', sup_rep(2.2), CFG) is None          # меньше min_m
+    assert C.settle_offset('wrong_surface', {}, CFG) is None
+
+
+def test_retries_settle_rounds():
+    bed = {'variant': 'support', 'label': 'bed', 'support_id': 'surf_4', 'body_dz': 0.0}
+    out = C.retries(bed, 'wrong_surface', [], CFG, 'wrong_surface', sup_rep(4.6, 4.3), None)
+    assert len(out) == 1 and out[0]['variant'] == 'support+settle' and out[0]['body_dz'] < 0
+    c = out[0]
+    for _ in range(CFG['settle']['rounds'] - 1):
+        c = C.retries(c, 'wrong_surface', [], CFG, 'wrong_surface', sup_rep(4.6), None)[0]
+    assert C.retries(c, 'wrong_surface', [], CFG, 'wrong_surface', sup_rep(4.6), None) == []   # лимит rounds
+    assert C.retries(dict(bed, label='floor'), 'wrong_surface', [], CFG, 'wrong_surface', sup_rep(4.6), None) == []
 
 
 # ------------------------------------------------------------------------------------------------ candidates_cli
@@ -409,7 +460,7 @@ def test_long_narrow_seat_is_bench():
             {'id': 'surf_1', 'type': 'other', 'height_m': 0.51, 'area_m2': 0.17, 'cells_xy': cells(0, 0, 1.3, .27, .05)},
             {'id': 'surf_2', 'type': 'other', 'height_m': 0.55, 'area_m2': 0.16, 'cells_xy': cells(3, 3, 3.45, 3.4, .05)}]
     lab = labels_of(objs)
-    assert lab['surf_1'] == 'bench' and lab['surf_2'] == 'nightstand'
+    assert lab['surf_1'] == 'bench' and lab['surf_2'] == 'seat'      # маленький верх 0.55 — «seat», не тумба
     table = [{'id': 'floor_1', 'type': 'floor', 'height_m': 0.0},
              {'id': 'surf_6', 'type': 'other', 'height_m': 0.78, 'area_m2': 0.17, 'cells_xy': cells(0, 0, 1.6, .24, .05)}]
     assert labels_of(table)['surf_6'] == 'table'                                # массажный стол, не тумба

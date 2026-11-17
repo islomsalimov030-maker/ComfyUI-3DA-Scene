@@ -197,8 +197,12 @@ def classify(objects, cfg):
             label = "bench"                         # длинный узкий верх на высоте сиденья (тумба почти квадратная)
         elif L is not None and L >= g["bench_min_len_m"] and top <= g["table_h"][1]:
             label = "table"                         # длинный верх на высоте стола (массажный стол, столешница)
+        elif area < g["small_top_max_area_m2"] and seat_h is not None and top <= g["small_seat_max_h_m"]:
+            label = "seat"                          # маленький верх на высоте сиденья: табурет, пуф или край скамьи,
+                                                    # обрезанной кадром; тумбу той же высоты не отличить — опора
+                                                    # только когда другой мебели для класса нет (fallback_only)
         elif area < g["small_top_max_area_m2"] and top <= g["table_h"][1]:
-            label = "nightstand"                    # маленький верх без спинки — тумба (табурет от неё не отличить)
+            label = "nightstand"                    # маленький верх без спинки выше сиденья — тумба
         elif seat_h is not None:
             label = "bench"
         elif top <= g["table_h"][1]:
@@ -238,15 +242,18 @@ def words(label, cfg):
 
 def support_rank(pose_class, label, cfg):
     """(ярус, номер) опоры для класса позы; None — не годится. Ярус 0 — имя в списке класса,
-    ярус 1 — подходит только синоним (например table → massage_table), имя в списке «не годятся» — None."""
+    ярус 1 — подходит только синоним (например table → massage_table), ярус 2 — fallback_only (опора, только если
+    другой мебели для класса нет), имя в списке «не годятся» — None."""
     rule = cfg["support_by_class"].get(pose_class)
     if rule is None:
         return None
-    allowed, deny = rule.get("allowed", []), rule.get("deny", [])
+    allowed, deny, spare = rule.get("allowed", []), rule.get("deny", []), rule.get("fallback_only", [])
     if label in deny:
         return None
     if label in allowed:
         return 0, allowed.index(label)
+    if label in spare:
+        return 2, spare.index(label)
     idx = [allowed.index(w) for w in cfg["synonyms"].get(label, []) if w in allowed]
     return (1, min(idx)) if idx else None
 
@@ -270,6 +277,8 @@ def supports_for(pose_class, objects, labels, hint, cfg):
                                                  str(hint["support"]).lower() == o["id"])
         found.append({"id": o["id"], "type": o.get("type", "other"), "label": label, "rank": list(rank),
                       "hinted": hinted, "area_m2": o.get("area_m2")})
+    if any(s["rank"][0] < 2 and s["label"] != "floor" for s in found):
+        found = [s for s in found if s["rank"][0] < 2]          # запасные (fallback_only) — только без другой мебели
     found.sort(key=lambda s: (not s["hinted"], s["rank"], -(s["area_m2"] or 0.0), s["id"]))
     # одна опора на группу мебели (куски одной кровати — один вариант места)
     seen, out = set(), []
@@ -341,7 +350,8 @@ def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts
         c = {"variant": variant, "target_object": support["type"] if support else "floor",
              "instance_hint": support["id"] if support else "", "support_id": support["id"] if support else None,
              "label": support["label"] if support else "floor", "secondary_contacts": secondary_contacts,
-             "body_dx": 0.0, "body_dy": 0.0, "body_dyaw": 0.0, "height_m": float(height_m), "floor_id": None}
+             "body_dx": 0.0, "body_dy": 0.0, "body_dz": 0.0, "body_dyaw": 0.0, "height_m": float(height_m),
+             "floor_id": None}
         c.update(kw)
         if support and c["label"] not in ("floor", "auto"):
             c["merge_ids"] = merge_ids(support["id"], objects, labels, cfg)
@@ -398,14 +408,42 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
     return out
 
 
-def retries(cand, place_status, flags, cfg):
-    """no_target из-за zone_too_small (маска опоры меньше следа тела) — тот же вариант с мягкой зоной
-    (candidates_cli: e1_zone_min_frac = cfg.zone_relax_frac); один раз, только для мебели."""
-    frac = cfg.get("zone_relax_frac")
-    if (not frac or place_status != "no_target" or "zone_too_small" not in (flags or []) or cand.get("zone_min_frac")
-            or cand["label"] == "floor"):
+def retries(cand, place_status, flags, cfg, status=None, rep=None, pose_class=None):
+    """Повторы того же места (мебель):
+    1) no_target из-за zone_too_small (маска опоры меньше следа тела) — мягкая зона (candidates_cli:
+       e1_zone_min_frac = cfg.zone_relax_frac) и опорные части cfg.zone_relax_support_parts[класс] (видимый кусок
+       сиденья меньше бёдер — контакт требуем только там, где поверхность есть); один раз;
+    2) тело над опорой (settle_offset) — то же место, опущенное на body_dz (постановка из кэша, только проверка)."""
+    if cand["label"] == "floor":
         return []
-    return [dict(cand, variant=cand["variant"] + "+zone", zone_min_frac=float(frac), origin="retry")]
+    frac = cfg.get("zone_relax_frac")
+    if frac and place_status == "no_target" and "zone_too_small" in (flags or []) and not cand.get("zone_min_frac"):
+        parts = (cfg.get("zone_relax_support_parts") or {}).get(pose_class)
+        extra = {"support_parts": ",".join(parts)} if parts and not cand.get("support_parts") else {}
+        return [dict(cand, variant=cand["variant"] + "+zone", zone_min_frac=float(frac), origin="retry", **extra)]
+    dz = settle_offset(status, rep, cfg)
+    if dz is not None and cand.get("settled", 0) < cfg["settle"]["rounds"]:
+        return [dict(cand, variant=cand["variant"] + "+settle", body_dz=round(float(cand.get("body_dz") or 0.0) + dz, 4),
+                     settled=cand.get("settled", 0) + 1, origin="retry")]
+    return []
+
+
+def settle_offset(status, rep, cfg):
+    """Тело стоит над опорой: опорные части не легли на её верх (3DA считает часть на поверхности, если ≥ половины
+    вершин не выше place.on_surf_m), поэтому статус wrong_surface/contact_fail при малом проникновении.
+    Сдвиг вниз (отрицательный body_dz, м): дальняя часть — до settle.target_m, но ближняя уходит в опору не больше
+    settle.sink_m и весь сдвиг ≤ settle.max_m; меньше settle.min_m или нет зазоров — None."""
+    s = cfg["settle"]
+    if status not in s["statuses"] or not isinstance(rep, dict):
+        return None
+    # contacts пересчитывает и проверка после body_dz (support_contact — нет): медиана зазора опорной части, см
+    vals = [float(c["gap_cm"]) / 100 for c in (rep.get("contacts") or {}).values()
+            if isinstance(c, dict) and c.get("role") == "support" and isinstance(c.get("gap_cm"), (int, float))
+            and math.isfinite(c["gap_cm"])]
+    if not vals or min(vals) <= 0:
+        return None
+    drop = min(max(vals) - s["target_m"], min(vals) + s["sink_m"], s["max_m"])
+    return -round(drop, 4) if drop >= s["min_m"] else None
 
 
 # ------------------------------------------------------------------------------------------------ оценка
@@ -456,7 +494,8 @@ def score(cand, status, rep, pose_class, cfg):
     elif rank is None:
         comp["support_class"] = 0.0
     else:
-        comp["support_class"] = max(0.0, (1.0 if rank[0] == 0 else s["support_tier1"]) - rank[1] * s["support_step"])
+        tier = (1.0, s["support_tier1"], s["support_tier2"])[rank[0]]
+        comp["support_class"] = max(0.0, tier - rank[1] * s["support_step"])
     comp["visibility"] = visibility(rep.get("frame") or {}, s)
     total_w = sum(w.values())
     # без постановки (fallback, no_target) итог 0: верная метка опоры не делает пустой вариант лучше реального
