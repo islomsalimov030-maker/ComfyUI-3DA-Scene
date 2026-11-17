@@ -1,0 +1,6 @@
+№;фото1;фото2;фото3;промпт;мод_персонаж;мод_лицо;мод_предмет
+1;room.png;pose.png;;a woman stands by the window;;;
+2;room.png;poses/pose2.png;extra.png;a woman sits on a chair and reads a book;;face_b;
+3;room.png;;;a woman leans on the table;;;
+4;room.png;missing.png;;a woman stands near the door;;;
+5;Room.PNG;pose;;;;;
