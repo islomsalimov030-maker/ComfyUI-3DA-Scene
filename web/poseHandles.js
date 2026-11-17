@@ -58,6 +58,7 @@ export function poseHandles(view, body, node, changed) {
     spheres[h] = mesh;
   }
   let active = null, posed = rest, frame = 0;
+  const limit = conf.max_offset_m * 0.99;
   const color = (h) => {
     const m = spheres[h].material;
     const c = h === active ? ACTIVE : offsets[h] ? EDITED : COLOR;
@@ -116,10 +117,9 @@ export function poseHandles(view, body, node, changed) {
     // положения IK, не сбрасывая остальные ручки на исходную позу.
     const { T } = solve(K, offsets, conf);
     const current = posedHandles(K, T)[h];
-    let d = [target[0] - current[0], target[1] - current[1], target[2] - current[2]];
-    const n = Math.hypot(...d), limit = conf.max_offset_m * 0.99;
-    if (n > limit) d = d.map(x => x * limit / n);
-    const combined = (offsets[h] ?? [0, 0, 0]).map((x, i) => x + d[i]);
+    const d = [target[0] - current[0], target[1] - current[1], target[2] - current[2]];
+    // Предел max_offset_m — для итогового сдвига ручки от исходной позы, а не для одного шага перетаскивания.
+    const combined = clampLength((offsets[h] ?? [0, 0, 0]).map((x, i) => x + d[i]), limit);
     if (Math.hypot(...combined) > 1e-6) offsets[h] = combined; else delete offsets[h];
     schedule();
   }
@@ -129,11 +129,16 @@ export function poseHandles(view, body, node, changed) {
     const out = {};
     for (const h of Object.keys(offsets)) {
       const a = body.object.localToWorld(vec(rest[h])), b = body.object.localToWorld(vec(local(h)));
-      out[h] = [b.x - a.x, b.y - a.y, b.z - a.z].map(x => Math.round(x * 1e6) / 1e6);
+      out[h] = clampLength([b.x - a.x, b.y - a.y, b.z - a.z], limit).map(x => Math.round(x * 1e6) / 1e6);
     }
     return out;
   }
   if (Object.keys(offsets).length) apply(); else sync();
+  // Веса — заранее, пока художник выбирает ручку: иначе первое движение ждёт их построения (~1–2 с на 300 тыс. вершин).
+  const idle = globalThis.requestIdleCallback ?? (f => setTimeout(f, 300));
+  const cancelIdle = globalThis.cancelIdleCallback ?? clearTimeout;
+  let prewarm = idle(() => { prewarm = null; try { for (const m of meshes) rigOf(m); } catch (e) { console.error('3DA веса позы:', e); } },
+    { timeout: 2000 });
   return {
     handles: HANDLES, labels: HANDLE_LABELS,
     sphere: h => spheres[h],
@@ -144,6 +149,7 @@ export function poseHandles(view, body, node, changed) {
     setVisible(v) { for (const h of HANDLES) spheres[h].visible = v; },
     dispose() {
       if (frame) cancelAnimationFrame(frame);
+      if (prewarm) cancelIdle(prewarm);
       for (const h of HANDLES) { scene.remove(spheres[h]); spheres[h].geometry.dispose(); spheres[h].material.dispose(); }
       view.forceRender?.();
     } };
@@ -163,4 +169,9 @@ function sphereMesh(r, seg, rings) {
     idx.push(a, b, a + 1, b, b + 1, a + 1);
   }
   return { positions: new Float32Array(pos), indices: new Uint16Array(idx) };
+}
+
+function clampLength(v, limit) {
+  const n = Math.hypot(...v);
+  return n > limit ? v.map(x => x * limit / n) : v;
 }

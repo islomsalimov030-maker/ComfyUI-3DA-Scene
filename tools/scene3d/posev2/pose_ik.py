@@ -131,6 +131,17 @@ def forward(J):
     return f if f is not None else np.array([1., 0., 0.])
 
 
+def pole_hint(J, side, knee):
+    """Анатомическое направление сустава. Колено — по стопе (пятка→носок): колено «смотрит» на носок при любом
+    наклоне корпуса. Локоть — назад и вниз в осях корпуса (опущенная рука — локоть назад, рука вперёд — вниз)."""
+    fwd = forward(J)
+    if knee:
+        foot = _unit(J[f"toe_{side}"] - J[f"heel_{side}"])
+        return foot if foot is not None else fwd
+    up = _unit(J["neck"] - J["j0"])
+    return -fwd - .5 * (up if up is not None else np.zeros(3))
+
+
 def segment_distance(points, a, b):
     ab = b - a
     t = np.clip(((points - a) @ ab) / max(float(ab @ ab), 1e-12), 0, 1)
@@ -180,19 +191,26 @@ def _frame(e, n):
     return np.column_stack([e, n, np.cross(e, n)])
 
 
-def two_bone(a, b, c, target, pole_hint, eps):
-    """Аналитическая IK плечо(a)–локоть(b)–кисть(c) к цели. Полюс — исходное смещение локтя от линии a–c
-    (для прямой конечности — pole_hint). Возвращает b', c', повороты костей R1, R2 и сведения."""
+def two_bone(a, b, c, target, pole_hint, eps, straight_deg=180., hint_side=False):
+    """Аналитическая IK плечо(a)–локоть(b)–кисть(c) к цели. Возвращает b', c', повороты костей R1, R2 и сведения.
+
+    Полюс (куда смотрит локоть/колено) — исходное смещение сустава от линии a–c. Анатомическая подсказка
+    pole_hint заменяет его, если конечность почти прямая (угол в суставе > straight_deg: у прямой ноги/руки
+    MHR смещение — шум в пару мм, часто в обратную сторону) или, при hint_side=True (колено), если исходный
+    полюс смотрит против подсказки (переразгибание). Сгиб всегда в сторону выбранного полюса."""
     a, b, c, target = (np.asarray(v, dtype=float) for v in (a, b, c, target))
     l1, l2 = float(np.linalg.norm(b - a)), float(np.linalg.norm(c - b))
     u = _unit(c - a)
     if u is None:
         u = _unit(b - a)
-    pole = (b - a) - ((b - a) @ u) * u
-    if np.linalg.norm(pole) < 1e-6 * max(l1, 1e-9):
-        pole = np.asarray(pole_hint, dtype=float) - (np.asarray(pole_hint, dtype=float) @ u) * u
-    pole = _unit(pole)
-    if pole is None:                                   # pole_hint вдоль конечности — любой перпендикуляр
+    source = (b - a) - ((b - a) @ u) * u
+    hint = np.asarray(pole_hint, dtype=float)
+    hint = _unit(hint - (hint @ u) * u)
+    bend_src = math.degrees(math.acos(np.clip((a - b) @ (c - b) / max(l1 * l2, 1e-18), -1, 1)))
+    use_hint = hint is not None and (np.linalg.norm(source) < 1e-6 * max(l1, 1e-9) or bend_src > straight_deg or
+                                     (hint_side and source @ hint <= 0))
+    pole = hint if use_hint else _unit(source)
+    if pole is None:                                   # подсказка вдоль конечности — любой перпендикуляр
         pole = _unit(np.cross(u, [1., 0., 0.])) if abs(u[0]) < .9 else _unit(np.cross(u, [0., 1., 0.]))
     normal = _unit(np.cross(u, pole))
     reach = target - a
@@ -209,10 +227,15 @@ def two_bone(a, b, c, target, pole_hint, eps):
     b2 = a + l1 * (cos_a * direction + sin_a * side)
     c2 = a + d * direction
     normal2 = _unit(np.cross(direction, side))
-    R1 = _frame((b2 - a) / l1, normal2) @ _frame((b - a) / l1, normal).T
-    R2 = _frame((c2 - b2) / l2, normal2) @ _frame((c - b) / l2, normal).T
+
+    def old_frame(e):                                  # нормаль плоскости сгиба, ортогональная кости (если полюс сменён)
+        n = normal - (normal @ e) * e
+        return _frame(e, _unit(n) if _unit(n) is not None else normal2)
+    R1 = _frame((b2 - a) / l1, normal2) @ old_frame((b - a) / l1).T
+    R2 = _frame((c2 - b2) / l2, normal2) @ old_frame((c - b) / l2).T
     info = dict(reached=bool(dmin <= dist <= dmax), straightened=bool(dist > dmax), error_m=float(np.linalg.norm(c2 - target)),
-                lengths_m=[round(l1, 5), round(l2, 5)],
+                lengths_m=[round(l1, 5), round(l2, 5)], pole="hint" if use_hint else "source",
+                bend_src_deg=round(bend_src, 2),
                 bend_deg=round(math.degrees(math.acos(np.clip((a - b2) @ (c2 - b2) / (l1 * l2), -1, 1))), 2))
     return b2, c2, R1, R2, info
 
@@ -266,17 +289,17 @@ def solve(KP, edits, conf=None):
         T.update(spine)
         for b in ("head", "upperarm_l", "forearm_l", "hand_l", "upperarm_r", "forearm_r", "hand_r"):
             T[b] = T["chest"]
-    fwd = forward(J)
     for s in "lr":
-        for handle, parent, names, bones, pole in (
-                (f"hand_{s}", "chest", ("sh", "el", "wr"), ("upperarm", "forearm", "hand"), -fwd),
-                (f"foot_{s}", "pelvis", ("hip", "kn", "an"), ("thigh", "shin", "foot"), fwd)):
+        for handle, parent, names, bones, knee in (
+                (f"hand_{s}", "chest", ("sh", "el", "wr"), ("upperarm", "forearm", "hand"), False),
+                (f"foot_{s}", "pelvis", ("hip", "kn", "an"), ("thigh", "shin", "foot"), True)):
             if handle not in edits:
                 continue
             Tp = T[parent]
             a, b, c = (apply(Tp, J[f"{n}_{s}"]) for n in names)
             target = J[f"{names[2]}_{s}"] + edits[handle]
-            b2, c2, R1, R2, inf = two_bone(a, b, c, target, pole, conf["reach_eps"])
+            b2, c2, R1, R2, inf = two_bone(a, b, c, target, Tp[0] @ pole_hint(J, s, knee), conf["reach_eps"],
+                                           conf["straight_deg"], hint_side=knee)
             T[f"{bones[0]}_{s}"] = compose((R1, a - R1 @ a), Tp)
             T[f"{bones[1]}_{s}"] = compose((R2, b2 - R2 @ b), Tp)
             T[f"{bones[2]}_{s}"] = compose((np.eye(3), c2 - c), Tp)

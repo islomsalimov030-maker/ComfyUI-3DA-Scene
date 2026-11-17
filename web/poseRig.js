@@ -83,6 +83,13 @@ function forward(J) {
   f = unit(sub(f, mul(up, dot(f, up))));
   return f ?? [1, 0, 0];
 }
+// Анатомическое направление сустава (= pose_ik.pole_hint): колено — к носку (пятка→носок), локоть — назад и вниз.
+function poleHint(J, s, knee) {
+  const fwd = forward(J);
+  if (knee) return unit(sub(J['toe_' + s], J['heel_' + s])) ?? fwd;
+  const up = unit(sub(J.neck, J.j0)) ?? [0, 0, 0];
+  return sub(mul(fwd, -1), mul(up, .5));
+}
 function segmentDistance(p, a, b) {
   const ab = sub(b, a), t = Math.min(1, Math.max(0, dot(sub(p, a), ab) / Math.max(dot(ab, ab), 1e-12)));
   return norm(sub(p, add(a, mul(ab, t))));
@@ -97,12 +104,18 @@ function nearestBone(p, J) {
 
 // ---------------------------------------------------------------------------------------------- IK
 // Аналитическая двухзвенная IK: длины костей неизменны, локоть/колено — только в сторону исходного полюса.
-export function twoBone(a, b, c, target, poleHint, eps) {
+// Полюс — исходное смещение сустава; подсказка poleHint заменяет его у почти прямой конечности (угол > straightDeg)
+// и, при hintSide (колено), если исходный полюс смотрит против подсказки (переразгибание).
+export function twoBone(a, b, c, target, poleHint, eps, straightDeg = 180, hintSide = false) {
   const l1 = norm(sub(b, a)), l2 = norm(sub(c, b));
   const u = unit(sub(c, a)) ?? unit(sub(b, a));
-  let pole = sub(sub(b, a), mul(u, dot(sub(b, a), u)));
-  if (norm(pole) < 1e-6 * Math.max(l1, 1e-9)) pole = sub(poleHint, mul(u, dot(poleHint, u)));
-  pole = unit(pole) ?? (Math.abs(u[0]) < .9 ? unit(cross(u, [1, 0, 0])) : unit(cross(u, [0, 1, 0])));
+  const source = sub(sub(b, a), mul(u, dot(sub(b, a), u)));
+  const hint = unit(sub(poleHint, mul(u, dot(poleHint, u))));
+  const bendSrc = Math.acos(Math.max(-1, Math.min(1, dot(sub(a, b), sub(c, b)) / Math.max(l1 * l2, 1e-18)))) * 180 / Math.PI;
+  const useHint = !!hint && (norm(source) < 1e-6 * Math.max(l1, 1e-9) || bendSrc > straightDeg ||
+    (hintSide && dot(source, hint) <= 0));
+  const pole = (useHint ? hint : unit(source)) ??
+    (Math.abs(u[0]) < .9 ? unit(cross(u, [1, 0, 0])) : unit(cross(u, [0, 1, 0])));
   const normal = unit(cross(u, pole));
   const reach = sub(target, a), dist = norm(reach);
   const dir = dist > 1e-9 ? mul(reach, 1 / dist) : u;
@@ -114,9 +127,11 @@ export function twoBone(a, b, c, target, poleHint, eps) {
   const b2 = add(a, mul(add(mul(dir, cosA), mul(side, sinA)), l1));
   const c2 = add(a, mul(dir, d));
   const normal2 = unit(cross(dir, side));
-  const R1 = mm(frame(mul(sub(b2, a), 1 / l1), normal2), tr(frame(mul(sub(b, a), 1 / l1), normal)));
-  const R2 = mm(frame(mul(sub(c2, b2), 1 / l2), normal2), tr(frame(mul(sub(c, b), 1 / l2), normal)));
+  const oldFrame = e => frame(e, unit(sub(normal, mul(e, dot(normal, e)))) ?? normal2);
+  const R1 = mm(frame(mul(sub(b2, a), 1 / l1), normal2), tr(oldFrame(mul(sub(b, a), 1 / l1))));
+  const R2 = mm(frame(mul(sub(c2, b2), 1 / l2), normal2), tr(oldFrame(mul(sub(c, b), 1 / l2))));
   return { b2, c2, R1, R2, info: { reached: dist >= dmin && dist <= dmax, straightened: dist > dmax,
+    pole: useHint ? 'hint' : 'source', bend_src_deg: bendSrc,
     error_m: norm(sub(c2, target)), lengths_m: [l1, l2], bend_deg: Math.acos(Math.max(-1, Math.min(1,
       dot(sub(a, b2), sub(c2, b2)) / (l1 * l2)))) * 180 / Math.PI } };
 }
@@ -159,15 +174,15 @@ export function solve(K, edits, conf) {
     info.chest = r.info;
     for (const b of ['head', 'upperarm_l', 'forearm_l', 'hand_l', 'upperarm_r', 'forearm_r', 'hand_r']) T[b] = T.chest;
   }
-  const fwd = forward(J);
   for (const s of ['l', 'r']) {
-    for (const [handle, parent, names, bones, pole] of [
-      ['hand_' + s, 'chest', ['sh', 'el', 'wr'], ['upperarm', 'forearm', 'hand'], mul(fwd, -1)],
-      ['foot_' + s, 'pelvis', ['hip', 'kn', 'an'], ['thigh', 'shin', 'foot'], fwd]]) {
+    for (const [handle, parent, names, bones, knee] of [
+      ['hand_' + s, 'chest', ['sh', 'el', 'wr'], ['upperarm', 'forearm', 'hand'], false],
+      ['foot_' + s, 'pelvis', ['hip', 'kn', 'an'], ['thigh', 'shin', 'foot'], true]]) {
       if (!edits[handle]) continue;
       const Tp = T[parent];
       const [a, b, c] = names.map(n => applyT(Tp, J[n + '_' + s]));
-      const r = twoBone(a, b, c, add(J[names[2] + '_' + s], edits[handle]), pole, conf.reach_eps);
+      const r = twoBone(a, b, c, add(J[names[2] + '_' + s], edits[handle]), mv(Tp.R, poleHint(J, s, knee)),
+        conf.reach_eps, conf.straight_deg ?? 180, knee);
       T[bones[0] + '_' + s] = compose({ R: r.R1, t: sub(a, mv(r.R1, a)) }, Tp);
       T[bones[1] + '_' + s] = compose({ R: r.R2, t: sub(r.b2, mv(r.R2, b)) }, Tp);
       T[bones[2] + '_' + s] = compose({ R: I3, t: sub(r.c2, c) }, Tp);

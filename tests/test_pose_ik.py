@@ -337,3 +337,86 @@ def test_frontend_matches_backend(tmp_path, body):
     H = ik.handle_points(K2)
     for h in ik.HANDLES:
         assert np.allclose(res['H'][h], H[h], atol=1e-5), h
+
+
+# ---------------------------------------------------------------------------------------------- круг 2: обратный сгиб
+FWD = np.array([1., 0, 0])                               # «вперёд» в случаях из ревью
+KNEE_CASES = {
+    # почти прямая нога, колено на 2 мм назад (шум MHR) — раньше колено уходило назад на 0.206 м
+    'leg_hyper_2mm': (np.array([0, 0, 1.0]), np.array([-.002, 0, .55]), np.array([0, 0, .1]), np.array([0, 0, .2])),
+    # заметное переразгибание (угол < straight_deg), колено против подсказки — тоже вперёд (hint_side)
+    'leg_hyper_8cm': (np.array([0, 0, 1.0]), np.array([-.08, 0, .55]), np.array([0, 0, .1]), np.array([0, 0, .25])),
+}
+ELBOW_CASES = {
+    # почти прямая рука, локоть на 3 мм вперёд — раньше локоть уходил вперёд на 0.198 м
+    'arm_hyper_3mm': (np.array([0, 0, 1.4]), np.array([.003, 0, 1.1]), np.array([0, 0, .8]), np.array([0, 0, .95])),
+}
+
+
+def elbow_hint(fwd=FWD, up=np.array([0, 0, 1.])):
+    return -fwd - .5 * up                                 # = pose_ik.pole_hint для локтя
+
+
+@pytest.mark.parametrize('name', sorted(KNEE_CASES))
+def test_knee_never_bends_backward(name):
+    a, b, c, target = KNEE_CASES[name]
+    b2, c2, R1, R2, info = ik.two_bone(a, b, c, target, FWD, CONF['reach_eps'], CONF['straight_deg'], hint_side=True)
+    assert info['pole'] == 'hint' and info['reached']
+    assert b2[0] > .1                                     # колено вперёд
+    assert np.allclose(c2, target, atol=1e-9)
+    assert abs(np.linalg.norm(b2 - a) - np.linalg.norm(b - a)) < 1e-9
+    assert abs(np.linalg.norm(c2 - b2) - np.linalg.norm(c - b)) < 1e-9
+    for R in (R1, R2):                                    # при смене полюса повороты остаются поворотами
+        assert np.allclose(R @ R.T, np.eye(3), atol=1e-9) and abs(np.linalg.det(R) - 1) < 1e-9
+    assert np.allclose(R1 @ (b - a), b2 - a, atol=1e-9) and np.allclose(R2 @ (c - b), c2 - b2, atol=1e-9)
+
+
+@pytest.mark.parametrize('name', sorted(ELBOW_CASES))
+def test_elbow_never_bends_forward_when_straight(name):
+    a, b, c, target = ELBOW_CASES[name]
+    b2, c2, _, _, info = ik.two_bone(a, b, c, target, elbow_hint(), CONF['reach_eps'], CONF['straight_deg'])
+    assert info['pole'] == 'hint' and info['reached']
+    assert b2[0] < -.1                                    # локоть назад
+    assert np.allclose(c2, target, atol=1e-9)
+
+
+def test_bent_elbow_keeps_its_own_pole():
+    """Рука вперёд, предплечье вверх: локоть смотрит вниз-вперёд, против подсказки «назад-вниз» в осях корпуса.
+    Это нормальный сгиб — полюс исходный, иначе рука выгнулась бы назад (поэтому hint_side только у колена)."""
+    a, b, c = np.array([0, 0, 1.4]), np.array([.3, 0, 1.4]), np.array([.3, 0, 1.68])
+    b2, c2, _, _, info = ik.two_bone(a, b, c, c + [0, 0, .05], elbow_hint(), CONF['reach_eps'], CONF['straight_deg'])
+    assert info['pole'] == 'source' and info['bend_src_deg'] < 100
+    u = (c2 - a) / np.linalg.norm(c2 - a)
+    off = (b2 - a) - ((b2 - a) @ u) * u
+    src = (b - a) - ((b - a) @ ((c - a) / np.linalg.norm(c - a))) * ((c - a) / np.linalg.norm(c - a))
+    assert off @ src > 0                                  # сгиб в прежнюю сторону
+
+
+def test_solve_hyperextended_leg_knee_toward_toes():
+    """Целиком через solve: колено переразогнуто на 1 см назад (вперёд = к носку, -y) — правка стопы гнёт колено к носку."""
+    K = skeleton()
+    K[11] = [.1, .01, .5]                                 # левое колено чуть назад (+y)
+    T, info = ik.solve(K, {'foot_l': np.array([0, -.05, .15])}, CONF)
+    knee = ik.apply(T['shin_l'], K[11])
+    assert info['foot_l']['pole'] == 'hint' and knee[1] < -.05
+
+
+@pytest.mark.skipif(NODE is None, reason='node не установлен')
+def test_frontend_pole_matches_backend(tmp_path):
+    cases = {**{k: (v, FWD, True) for k, v in KNEE_CASES.items()},
+             **{k: (v, elbow_hint(), False) for k, v in ELBOW_CASES.items()}}
+    data = {k: dict(abc=[x.tolist() for x in v], hint=h.tolist(), knee=kn) for k, (v, h, kn) in cases.items()}
+    script = tmp_path / 'pole.mjs'
+    script.write_text(
+        f"import * as rig from {json.dumps((ROOT / 'web/poseRig.js').as_uri())};\n"
+        f"const d = {json.dumps(data)}, conf = {json.dumps(CONF)};\n"
+        "const out = {};\n"
+        "for (const [k, v] of Object.entries(d)) { const [a, b, c, t] = v.abc;\n"
+        "  const r = rig.twoBone(a, b, c, t, v.hint, conf.reach_eps, conf.straight_deg, v.knee);\n"
+        "  out[k] = {b2: r.b2, c2: r.c2, pole: r.info.pole}; }\n"
+        "process.stdout.write(JSON.stringify(out));\n", encoding='utf-8')
+    res = json.loads(subprocess.run([NODE, str(script)], capture_output=True, text=True, check=True).stdout)
+    for k, (v, h, kn) in cases.items():
+        b2, c2, _, _, info = ik.two_bone(*v, h, CONF['reach_eps'], CONF['straight_deg'], hint_side=kn)
+        assert res[k]['pole'] == info['pole'] and np.allclose(res[k]['b2'], b2, atol=1e-9), k
+        assert np.allclose(res[k]['c2'], c2, atol=1e-9), k
