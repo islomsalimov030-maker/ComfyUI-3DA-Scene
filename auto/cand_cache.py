@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = 'e6-cache-v1'
+VERSION = 'e6-cache-v2'
 
 
 def _torch():

@@ -188,3 +188,25 @@ def test_cache_broken_entry_recomputes_and_prune(monkeypatch, tmp_path):
     c.root.mkdir(exist_ok=True)
     c.prune()
     assert len([p for p in c.root.iterdir()]) == 2
+
+
+def test_cache_survives_location_dir_rewrite(monkeypatch, tmp_path):
+    """3DALocation переписывает папку профиля при каждом своём прогоне — ключ кэша от этого не меняется."""
+    N = load_nodes()
+    loc = tmp_path / 'locations' / 'auto_abc' / 'profile.json'
+    loc.parent.mkdir(parents=True)
+    loc.write_text(json.dumps({'loc_id': 'auto_abc', 'objects': [], 't': 1}), encoding='utf-8')
+    monkeypatch.setenv('THREEDA_CAND_CACHE', str(tmp_path / 'cache'))
+
+    def call(pick):
+        execute, calls = fake_execute({'surf_1': 'wrong_surface', 'surf_4': 'ok'})
+        monkeypatch.setattr(N.PlacePose, 'execute', execute)
+        out = N.PlaceCandidates().execute(str(loc), torch.zeros((1, 8, 8, 3)), 'sit_edge', '', '', 2.30, '', 'grey',
+                                          1., 101, json.dumps(room()), n_candidates=4, pick=pick)
+        return json.loads(out[10]), calls
+    s1, c1 = call(-1)
+    assert s1['cache'] == 'miss' and len(c1) == 3
+    loc.write_text(json.dumps({'loc_id': 'auto_abc', 'objects': [], 't': 2}), encoding='utf-8')
+    (loc.parent / 'objects_preview.png').write_bytes(b'new')
+    s2, c2 = call(0)
+    assert s2['cache'] == 'hit' and c2 == [] and s2['chosen'] == 0

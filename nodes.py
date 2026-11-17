@@ -1966,7 +1966,10 @@ class PlaceCandidates:
          n_candidates, block_on_fail, hint_json, pose_text, props, body_transform, megapixels, settings,
          variant_set, passport) = fields
         h = hashlib.sha256()
-        h.update(PlacePose.fingerprint(location, props, body_json=body_json).encode('utf-8'))
+        # Файлы кода, настроек, тела и предметов — как у 3DAPlacePose, но без папки локации: 3DALocation
+        # переписывает её при каждом своём прогоне (ComfyUI вытесняет его кэш чужими задачами), и ключ «плыл».
+        # Комнату задают путь профиля (auto_<хэш фото>) и её objects — оба входят в ключ ниже.
+        h.update(PlacePose.fingerprint(None, props, body_json=body_json).encode('utf-8'))
         ref = pose_ref.detach().cpu().float().numpy() if hasattr(pose_ref, 'detach') else np.asarray(pose_ref)
         h.update(str(ref.shape).encode('utf-8'))
         h.update(np.ascontiguousarray(ref).tobytes())
