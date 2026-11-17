@@ -7,8 +7,9 @@
    e1_zone_min_frac × след тела (штатно 1.0);
 3. пол для авто-профиля без однозначного пола (request e1_floor_id: кусок surf_N, выбранный кандидатами) —
    штатно pack_cli отказывает «auto profile floor is ambiguous»;
-4. куски одной мебели — одна опора (request e1_merge_ids: «surf_4,surf_3,surf_2», первый — цель).
-Кэш постановок с опциями 2–4 — с отдельным ключом, чтобы 3DAPlacePose с теми же входами не получил постановку,
+4. куски одной мебели — одна опора (request e1_merge_ids: «surf_4,surf_3,surf_2», первый — цель);
+5. меньше ячеек зоны на одну опору (request e1_attempts) — кандидаты сами перебирают опоры, лимит времени общий.
+Кэш постановок с опциями 2–5 — с отдельным ключом, чтобы 3DAPlacePose с теми же входами не получил постановку,
 которую сам бы отверг.
 
 python candidates_cli.py place --request R --output O   (узел; дальше сам запускает geometry-воркер)
@@ -71,6 +72,10 @@ def patch(request, config, captured):
             self.data.setdefault("auto_surfaces", {})["floor_status"] = "ok"
         profiles.LocationProfile.__init__ = __init__
         salt.append(f"e1_floor_id={floor_id}")
+    attempts = request.get("e1_attempts")
+    if attempts:
+        place.ATTEMPTS = int(attempts)              # ячеек зоны на опору (штатно place.attempts из YAML)
+        salt.append(f"e1_attempts={int(attempts)}")
     merge = [x for x in str(request.get("e1_merge_ids") or "").split(",") if x]
     if len(merge) > 1:
         merge_support(merge, place)

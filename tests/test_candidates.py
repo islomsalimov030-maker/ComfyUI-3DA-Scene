@@ -255,7 +255,9 @@ def test_cli_zone_relax_and_cache_key(monkeypatch):
     assert place.zone_too_small(d)                                             # штатно: 0.2 < 0.3 — нет цели
     cc.patch({}, {'farm_root': '.', 'comfy': '.'}, {})
     assert place.zone_too_small(d) and manual_pose.placement_key() == 'abc'    # без опции — как было
-    cc.patch({'e1_zone_min_frac': 0.5}, {'farm_root': '.', 'comfy': '.'}, {})
+    monkeypatch.setattr(place, 'ATTEMPTS', place.ATTEMPTS)
+    cc.patch({'e1_zone_min_frac': 0.5, 'e1_attempts': 2}, {'farm_root': '.', 'comfy': '.'}, {})
+    assert place.ATTEMPTS == 2
     assert not place.zone_too_small(d) and place.zone_too_small(dict(d, zone_mask_area_m2=0.1))
     assert manual_pose.placement_key() != 'abc'                                # свой ключ кэша
 
@@ -367,6 +369,7 @@ def test_merge_ids_for_bed_pieces():
     assert C.merge_ids('surf_1', objs, lab, CFG) is None                      # спинка 0.92 — не та высота
     sit = C.plan('sit_edge', objs, lab, {}, 4, CFG, 2.30)
     assert sit[1]['merge_ids'] == 'surf_4,surf_5' and sit[0].get('merge_ids') is None
+    assert sit[0]['attempts'] == CFG['furniture_attempts'] and sit[-1].get('attempts') is None   # пол — штатно
 
 
 def test_cli_merge_support(monkeypatch, tmp_path):
@@ -399,3 +402,15 @@ def test_cli_merge_support(monkeypatch, tmp_path):
     assert reg.mask.sum() == 40 * 30 and reg.object_id == 'surf_2' and abs(reg.h0 - .535) < .02
     assert place.match_auto_support(None, reg, 2.3)[0] is None               # не перевыбирать один кусок
     assert prof.region(prof.data['objects'][1]).mask.sum() == 5 * 30          # чужие куски — как были
+
+
+def test_long_narrow_seat_is_bench():
+    objs = [{'id': 'floor_1', 'type': 'floor', 'height_m': 0.0, 'area_m2': 12.0},
+            {'id': 'surf_1', 'type': 'other', 'height_m': 0.51, 'area_m2': 0.17, 'cells_xy': cells(0, 0, 1.3, .27, .05)},
+            {'id': 'surf_2', 'type': 'other', 'height_m': 0.55, 'area_m2': 0.16, 'cells_xy': cells(3, 3, 3.45, 3.4, .05)}]
+    lab = labels_of(objs)
+    assert lab['surf_1'] == 'bench' and lab['surf_2'] == 'nightstand'
+    table = [{'id': 'floor_1', 'type': 'floor', 'height_m': 0.0},
+             {'id': 'surf_6', 'type': 'other', 'height_m': 0.78, 'area_m2': 0.17, 'cells_xy': cells(0, 0, 1.6, .24, .05)}]
+    assert labels_of(table)['surf_6'] == 'table'                                # массажный стол, не тумба
+    assert C.support_rank('lie', 'table', CFG)[0] == 1 and C.support_rank('sit_edge', 'table', CFG) is None

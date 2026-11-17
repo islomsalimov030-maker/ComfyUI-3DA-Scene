@@ -193,6 +193,10 @@ def classify(objects, cfg):
             label = "bed"
         elif seat_h is not None and back is not None:
             label = "sofa"                          # сиденье + спинка: и маленький видимый кусок сиденья — диван
+        elif seat_h is not None and L is not None and L >= g["bench_min_len_m"]:
+            label = "bench"                         # длинный узкий верх на высоте сиденья (тумба почти квадратная)
+        elif L is not None and L >= g["bench_min_len_m"] and top <= g["table_h"][1]:
+            label = "table"                         # длинный верх на высоте стола (массажный стол, столешница)
         elif area < g["small_top_max_area_m2"] and top <= g["table_h"][1]:
             label = "nightstand"                    # маленький верх без спинки — тумба (табурет от неё не отличить)
         elif seat_h is not None:
@@ -341,6 +345,7 @@ def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts
         c.update(kw)
         if support and c["label"] not in ("floor", "auto"):
             c["merge_ids"] = merge_ids(support["id"], objects, labels, cfg)
+            c["attempts"] = cfg["furniture_attempts"]
         if c["label"] == "floor" and c["target_object"] != "auto":
             # пол — всегда штатный target «floor»; без своего пола у профиля — выбранный кусок (e1_floor_id)
             c.update(target_object="floor", instance_hint="", floor_id=floor_id,
