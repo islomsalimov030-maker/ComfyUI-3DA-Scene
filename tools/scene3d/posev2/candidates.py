@@ -195,6 +195,9 @@ def classify(objects, cfg):
             label = "sofa"                          # сиденье + спинка: и маленький видимый кусок сиденья — диван
         elif seat_h is not None and L is not None and L >= g["bench_min_len_m"]:
             label = "bench"                         # длинный узкий верх на высоте сиденья (тумба почти квадратная)
+        elif (L is not None and L >= g["bench_min_len_m"] and W <= g["bench_max_w_m"]
+              and g["low_bench_h"][0] <= top < g["seat_h"][0]):
+            label = "bench"                         # длинный узкий верх ниже сиденья — низкая (спортивная) скамья
         elif L is not None and L >= g["bench_min_len_m"] and top <= g["table_h"][1]:
             label = "table"                         # длинный верх на высоте стола (массажный стол, столешница)
         elif area < g["small_top_max_area_m2"] and seat_h is not None and top <= g["small_seat_max_h_m"]:
@@ -340,6 +343,22 @@ def merge_ids(sid, objects, labels, cfg):
     return ",".join(ids) if len(ids) > 1 else None
 
 
+def floor_merge_ids(floor_id, objects, labels, cfg):
+    """Пол без однозначного пола у профиля — куски на уровне пола (метка floor) в пределах geometry.merge_dh_m от
+    выбранного: одна опора «floor_id,…» (иначе таз на соседнем куске пола того же уровня — wrong_surface); None —
+    у профиля свой пол или кусок один."""
+    if not floor_id:
+        return None
+    by_id = {o["id"]: o for o in objects}
+    h = _h(by_id.get(floor_id, {}))
+    if h is None:
+        return None
+    ids = [floor_id] + sorted(i for i, v in labels.items() if v.get("label") == "floor" and i != floor_id
+                              and i in by_id and by_id[i].get("type") != "wall" and _h(by_id[i]) is not None
+                              and abs(_h(by_id[i]) - h) <= cfg["geometry"]["merge_dh_m"])
+    return ",".join(ids) if len(ids) > 1 else None
+
+
 # ------------------------------------------------------------------------------------------------ план
 def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts=""):
     """Начальный список кандидатов (до n). Производные варианты (разворот +180, рост/масштаб) добавляет
@@ -359,7 +378,9 @@ def plan(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contacts
         if c["label"] == "floor" and c["target_object"] != "auto":
             # пол — всегда штатный target «floor»; без своего пола у профиля — выбранный кусок (e1_floor_id)
             c.update(target_object="floor", instance_hint="", floor_id=floor_id,
-                     support_id=floor_id or c["support_id"])
+                     support_id=floor_id or c["support_id"],
+                     merge_ids=None if pose_class in cfg["floor_merge_skip"] else
+                     floor_merge_ids(floor_id, objects, labels, cfg))
         return c
     out = []
     if pose_class == "auto":

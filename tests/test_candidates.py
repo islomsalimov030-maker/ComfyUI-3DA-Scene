@@ -377,6 +377,22 @@ def test_floor_choice_without_profile_floor():
     sit = C.plan('sit_edge', objs, lab, {}, 4, CFG, 2.30)
     assert sit[-1]['variant'] == 'baseline' and sit[-1]['floor_id'] == 'surf_2'
     assert C.floor_choice(room(), C.classify(room(), CFG)) is None          # свой floor_1 — штатно
+    # куски пола одной опорой — кроме stand; кусок дальше merge_dh_m по высоте — отдельно
+    assert stand.get('merge_ids') is None
+    lie = C.plan('lie', objs + [{'id': 'surf_4', 'type': 'other', 'height_m': -0.10, 'area_m2': 0.3}],
+                 C.classify(objs + [{'id': 'surf_4', 'type': 'other', 'height_m': -0.10, 'area_m2': 0.3}], CFG),
+                 {}, 4, CFG, 2.30)
+    floor = next(c for c in lie if c['label'] == 'floor')
+    assert floor['floor_id'] == 'surf_2' and floor['merge_ids'] == 'surf_2,surf_1'
+    assert C.floor_merge_ids(None, objs, lab, CFG) is None
+
+
+def test_low_long_narrow_is_bench():
+    objs = [{'id': 'floor_1', 'type': 'floor', 'height_m': 0.0, 'area_m2': 6.0},
+            {'id': 'surf_1', 'type': 'other', 'height_m': 0.17, 'area_m2': 0.9, 'cells_xy': cells(0, 0, 2.8, .45, .05)},
+            {'id': 'surf_2', 'type': 'other', 'height_m': 0.17, 'area_m2': 2.0, 'cells_xy': cells(3, 3, 5, 4, .05)}]
+    lab = labels_of(objs)
+    assert lab['surf_1'] == 'bench' and lab['surf_2'] != 'bench'           # широкий низкий верх — не скамья
 
 
 def test_visibility_and_yaw_penalty():
