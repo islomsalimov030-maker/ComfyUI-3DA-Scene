@@ -1846,6 +1846,8 @@ class PlaceCandidates:
                      'support_object': cm.actual_support(rep, c, labels, objs) if st != 'fallback' else 'other',
                      'support_gap_cm': rep.get('support_gap_cm'), 'max_penetration_cm': rep.get('max_penetration_cm'),
                      'support_depth_m': rep.get('support_depth_m'),
+                     'visual_metrics': rep.get('visual_metrics'),
+                     'support_contact': rep.get('support_contact'),
                      'flags': rep.get('flags'), 'zone': (rep.get('zone_diagnostics') or {}) if st == 'fallback' else None,
                      'error': outs[5].partition('\n')[0][:200] if st == 'fallback' else None,
                      'score': value, 'components': comp, 'seconds': round(time.monotonic() - started, 1)}
