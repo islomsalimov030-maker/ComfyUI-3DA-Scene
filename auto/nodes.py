@@ -17,6 +17,9 @@ from . import store
 from . import report as report_mod
 from .vision import VisionPick
 from . import parse as parse_mod
+from .mask_box import MaskBox
+from .mask_box_candidates import MaskBoxCandidates
+from .mask_box_pack import MaskBoxPack
 
 CATEGORY = '3DA/auto'
 N = batch_mod.N_PHOTOS
@@ -277,7 +280,11 @@ class ParseHint:
 
 
 NODE_CLASS_MAPPINGS = {'3DAAutoBatch': AutoBatch, '3DAAutoRow': AutoRow, '3DAAutoSave': AutoSave, '3DAAutoReport': AutoReport,
-                       '3DAVisionPick': VisionPick, '3DAParseHint': ParseHint}
+                       '3DAVisionPick': VisionPick, '3DAParseHint': ParseHint, '3DAMaskBox': MaskBox,
+                       '3DAMaskBoxCandidates': MaskBoxCandidates, '3DAMaskBoxPack': MaskBoxPack}
 NODE_DISPLAY_NAME_MAPPINGS = {'3DAAutoBatch': '3DA · пакет: загрузка', '3DAAutoRow': '3DA · пакет: строка',
                               '3DAAutoSave': '3DA · пакет: сохранить', '3DAAutoReport': '3DA · пакет: отчёт',
-                              '3DAVisionPick': '3DA · выбор кандидата (зрение)', '3DAParseHint': '3DA · разбор промпта'}
+                              '3DAVisionPick': '3DA · выбор кандидата (зрение)', '3DAParseHint': '3DA · разбор промпта',
+                              '3DAMaskBox': '3DA · маска-прямоугольник',
+                              '3DAMaskBoxCandidates': '3DA · маска-прямоугольник с постановкой',
+                              '3DAMaskBoxPack': '3DA · передать силуэт кандидата'}
