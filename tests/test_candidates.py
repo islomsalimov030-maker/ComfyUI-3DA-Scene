@@ -147,8 +147,9 @@ def test_derived_frame_shifts_require_bad_frame_evidence():
     assert missing == []
     bad = {'visual_metrics': {'height_fraction': 1.125, 'cropped_edges': ['right', 'bottom']}}
     shifted = C.derived([cand], [{'report': bad}], CFG, 1, [], None, cand)
-    assert len(shifted) == len(CFG['frame_shifts_m'])
+    assert len(shifted) == len(CFG['frame_shifts_m']) + len(CFG['frame_depth_shifts_m']['farther'])
     assert shifted[1]['support_id'] == 'surf_1' and shifted[1]['body_dx'] == CFG['frame_shifts_m'][1][0]
+    assert [x['body_dy'] for x in shifted[-2:]] == CFG['frame_depth_shifts_m']['farther']
 
 
 def test_derived_rotated_support_centers_fitted_pelvis_and_shifts_thirds():
@@ -174,6 +175,30 @@ def test_derived_rotated_support_centers_fitted_pelvis_and_shifts_thirds():
         fallback = C.derived([cand], [{'report': bad}], CFG, 1, [], None, cand)
         delta = [fallback[1]['body_dx'] - .2, fallback[1]['body_dy'] + .1]
         assert np.allclose(delta, CFG['frame_shifts_m'][1])
+
+
+def test_derived_depth_shifts_follow_frame_height():
+    cand = {'variant': 'support', 'support_id': 'floor_1', 'label': 'floor', 'body_dx': 0., 'body_dy': .1}
+    too_large = {'report': {'visual_metrics': {'height_fraction': .95, 'cropped_edges': ['top'],
+                                               'visible_fraction': 1.0}}}
+    farther = C.derived([cand], [too_large], CFG, 1, [], None, cand)
+    assert [x['body_dy'] for x in farther[-len(CFG['frame_depth_shifts_m']['farther']):]] == [
+        0.1 + x for x in CFG['frame_depth_shifts_m']['farther']]
+    too_small = {'report': {'visual_metrics': {'height_fraction': .10, 'cropped_edges': [],
+                                               'visible_fraction': 1.0}}}
+    closer = C.derived([cand], [too_small], CFG, 1, [], None, cand)
+    assert [x['body_dy'] for x in closer[-len(CFG['frame_depth_shifts_m']['closer']):]] == [
+        0.1 - x for x in CFG['frame_depth_shifts_m']['closer']]
+
+
+def test_derived_recline_pitch_variants_for_high_torso_gap():
+    cand = {'variant': 'support', 'support_id': 'surf_4', 'label': 'bed', 'support_parts': 'pelvis,torso',
+            'body_dx': 0., 'body_dy': 0., 'body_dpitch': 0.}
+    report = {'visual_metrics': {'height_fraction': .55, 'cropped_edges': [], 'visible_fraction': .95},
+              'contacts': {'torso': {'role': 'secondary', 'gap_cm': 31.9}}}
+    out = C.derived([cand], [{'report': report}], CFG, 1, [], None, cand)
+    assert [x['body_dpitch'] for x in out] == CFG['recline_pitch_shifts_deg']
+    assert all(x['origin'] == 'derived' and x['support_id'] == 'surf_4' for x in out)
 
 
 def test_derived_occlusion_only_and_all_candidates_requirement():
@@ -275,7 +300,8 @@ def fake_execute(statuses):
                 instance_hint, height_m, body_json, proxy, strength, seed, block_on_fail=False,
                 body_dx=0., body_dy=0., body_dz=0., body_dyaw=0., body_dpitch=0., body_droll=0., pose_text='',
                 props='[]', body_transform='', megapixels=0., settings=None):
-        calls.append(dict(target_object=target_object, instance_hint=instance_hint, body_dyaw=body_dyaw))
+        calls.append(dict(target_object=target_object, instance_hint=instance_hint, body_dyaw=body_dyaw,
+                          body_dpitch=body_dpitch, body_droll=body_droll))
         st = statuses.get(instance_hint or target_object, 'fallback')
         img = torch.full((1, 48, 64, 3), .1 * len(calls))
         mask = torch.zeros((1, 48, 64))
@@ -328,6 +354,21 @@ def test_node_picks_best_and_pick(monkeypatch):
     assert out[9] == {'n': 2}                                 # body_guides выбранного кандидата
     out, _ = run_node(N, monkeypatch, {'surf_1': 'wrong_surface', 'surf_4': 'ok'}, pick=0)
     assert json.loads(out[5].split('\n', 1)[1])['candidate_index'] == 0
+
+
+def test_node_passes_derived_pitch_and_roll(monkeypatch):
+    N = load_nodes()
+    monkeypatch.delenv('THREEDA_CAND_CACHE', raising=False)
+    monkeypatch.setattr(N, 'candidates_helpers', lambda: C)
+    cand = {'variant': 'recline_pitch', 'target_object': 'bed', 'instance_hint': 'surf_4', 'support_id': 'surf_4',
+            'label': 'bed', 'support_parts': 'pelvis,torso', 'secondary_contacts': '', 'height_m': 2.3,
+            'body_dx': 0., 'body_dy': 0., 'body_dz': 0., 'body_dyaw': 0., 'body_dpitch': 20., 'body_droll': -3.}
+    monkeypatch.setattr(C, 'plan', lambda *args, **kwargs: [cand])
+    execute, calls = fake_execute({'surf_4': 'ok'})
+    monkeypatch.setattr(N.PlacePose, 'execute', execute)
+    N.PlaceCandidates().execute('missing/profile.json', torch.zeros((1, 8, 8, 3)), 'recline', '', '', 2.30, '',
+                                 'grey', 1., 101, json.dumps(room()), n_candidates=1)
+    assert calls[0]['body_dpitch'] == 20. and calls[0]['body_droll'] == -3.
 
 
 def test_node_never_raises(monkeypatch):
@@ -508,7 +549,8 @@ def test_visibility_and_yaw_penalty():
     assert C.visibility_fraction({'frame': {'ok': True}, 'keypoints_body25_px': [[0, 0, 1]]}) is None
     base, _ = C.score({'label': 'floor'}, 'ok', rep('ok'), 'stand', CFG)
     turned, _ = C.score({'label': 'floor', 'body_dyaw': 25.0}, 'ok', rep('ok'), 'stand', CFG)
-    assert turned < base                                                      # тот же отчёт, но отход от референса
+    tilted, _ = C.score({'label': 'floor', 'body_dpitch': 20.0, 'body_droll': -5.0}, 'ok', rep('ok'), 'stand', CFG)
+    assert turned < base and tilted < base                                    # ручной поворот/наклон — отход от референса
 
 
 def test_cli_floor_id(monkeypatch, tmp_path):

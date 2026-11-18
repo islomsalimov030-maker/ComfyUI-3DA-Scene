@@ -1828,7 +1828,7 @@ class PlaceCandidates:
             outs = pose.execute(location, pose_ref, pc, c['target_object'], c.get('support_parts') or support_parts,
                                 c['secondary_contacts'], c['instance_hint'], c['height_m'], body_json, proxy, strength,
                                 seed, block_on_fail, c['body_dx'], c['body_dy'], c.get('body_dz', 0.), c['body_dyaw'],
-                                0., 0., pose_text, props,
+                                c.get('body_dpitch', 0.), c.get('body_droll', 0.), pose_text, props,
                                 body_transform, megapixels, settings)
             st, rep = cm.report_of(outs[5])
             place_status = rep.get('status') if rep else None
@@ -1838,7 +1838,8 @@ class PlaceCandidates:
             value, comp = cm.score(c, st, rep if st != 'fallback' else {}, pc, cfg)
             entry = {'index': index, **{k: c.get(k) for k in ('variant', 'target_object', 'instance_hint', 'support_id',
                                                               'label', 'secondary_contacts', 'support_parts', 'body_dx',
-                                                              'body_dy', 'body_dz', 'body_dyaw', 'height_m',
+                                                              'body_dy', 'body_dz', 'body_dyaw', 'body_dpitch',
+                                                              'body_droll', 'height_m',
                                                               'zone_min_frac', 'floor_id', 'merge_ids', 'attempts')},
                      'geometry': labels.get(c['support_id'] or '', {}).get('features'),
                      'status': st, 'place_status': place_status,
@@ -1849,7 +1850,8 @@ class PlaceCandidates:
                      'error': outs[5].partition('\n')[0][:200] if st == 'fallback' else None,
                      'score': value, 'components': comp, 'seconds': round(time.monotonic() - started, 1)}
             dz = f" dz{c['body_dz']:+.2f}" if c.get('body_dz') else ''
-            caption = f"#{index} {c['support_id'] or c['target_object']} {c['label']} yaw{c['body_dyaw']:+g}{dz} {st} {value:.2f}"
+            dpitch = f" pitch{c['body_dpitch']:+g}" if c.get('body_dpitch') else ''
+            caption = f"#{index} {c['support_id'] or c['target_object']} {c['label']} yaw{c['body_dyaw']:+g}{dpitch}{dz} {st} {value:.2f}"
             return outs, rep, entry, caption
 
         limit = float(cfg['max_seconds'])

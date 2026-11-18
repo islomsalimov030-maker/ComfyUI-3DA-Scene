@@ -387,6 +387,9 @@ candidates:
   room_scale_tol: 0.15        # |room_scale − 1| больше — room_scale_suspect и кандидат с height_m / room_scale
   frame_shifts_m: [[0.0, 0.0], [0.5, 0.0], [-0.5, 0.0]] # резерв, если паспорт/профиль не дал размеры опоры
   frame_shifts_thirds: [0, 1, -1] # центр и сдвиги по горизонтали кадра на треть длины опоры в обе стороны
+  frame_depth_shifts_m: {farther: [0.5, 1.0], closer: [0.25, 0.5, 1.0]} # коррекция масштаба вдоль глубины камеры
+  recline_torso_gap_cm: 10.0 # при зазоре корпуса recline над опорой добавить варианты наклона
+  recline_pitch_shifts_deg: [-20.0, 20.0] # поворот корпуса вокруг камеры для поиска контакта с поверхностью
   frame:                      # визуальные составляющие по силуэту итогового тела
     height_min_frac: 0.15     # слишком маленькая доля высоты кадра — штраф
     height_max_frac: 0.85     # слишком большая доля высоты кадра — штраф
@@ -398,15 +401,15 @@ candidates:
     canvas_expansion: 3       # нечётный множитель растра для полного силуэта за краями кадра
     mask_threshold: 128       # бинаризация масок рендера (0..255)
   weights:                    # итоговая оценка 0..1 = Σ вес·составляющая / Σ весов
-    status: 0.30
-    gap: 0.08
-    penetration: 0.08
-    pose_match: 0.08
-    support_class: 0.20
+    status: 0.20
+    gap: 0.07
+    penetration: 0.06
+    pose_match: 0.05
+    support_class: 0.27
     visibility: 0.10
-    frame_height: 0.08
-    crop: 0.05
-    depth: 0.03
+    frame_height: 0.13
+    crop: 0.11
+    depth: 0.01
   score:
     status: {ok: 1.0, partial: 0.7, out_of_frame: 0.3, contact_fail: 0.2, wrong_surface: 0.1, no_target: 0.0, fallback: 0.0}
     gap_scale_cm: 5.0

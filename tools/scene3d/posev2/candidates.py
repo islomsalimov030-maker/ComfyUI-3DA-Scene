@@ -423,7 +423,8 @@ def _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contac
              "label": support["label"] if support else "floor", "secondary_contacts": secondary_contacts,
              "support_parts": ",".join(cfg.get("lie_contact_support_parts", []))
              if pose_class in ("lie", "recline") else None,
-             "body_dx": 0.0, "body_dy": 0.0, "body_dz": 0.0, "body_dyaw": 0.0, "height_m": float(height_m),
+             "body_dx": 0.0, "body_dy": 0.0, "body_dz": 0.0, "body_dyaw": 0.0,
+             "body_dpitch": 0.0, "body_droll": 0.0, "height_m": float(height_m),
              "floor_id": None}
         c.update(kw)
         if support:
@@ -472,8 +473,8 @@ def _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contac
 
 def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
     """Варианты по отчётам: разворот +180 у мебели (в пределах n_max); если все места плохи по
-    кадру/видимости — сдвиги на треть длины вдоль мировой оси опоры, преобразованные в базис камеры.
-    Центр вычисляется относительно таза после fit. Без геометрии — резервные сдвиги.
+    кадру/видимости — центр и сдвиги на треть длины опоры, плюс глубина для слишком крупного/малого кадра.
+    При большом зазоре корпуса добавляются наклоны recline; центр и дельты вычисляются после fit.
     При room_scale_suspect — сверх n_max ещё лучший кандидат с height_m / room_scale."""
     extra = []
     for c, r in zip(cands, results):
@@ -493,14 +494,16 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
             visible = visibility_fraction(rep)
             bad.append(height_score == 0.0 or crop_score == 0.0 or
                        (visible is not None and visible < cfg["visibility"]["min_visible_frac"]))
+        base = best_cand or cands[0]
+        base_index = next((i for i, c in enumerate(cands) if c is base), None)
+        if base_index is None:
+            base_index = next((i for i, c in enumerate(cands) if c == base), None)
+        if base_index is None:
+            base_index = next((i for i, c in enumerate(cands) if c.get('support_id') == base.get('support_id')
+                               and c.get('label') == base.get('label')), None)
+        rep = ((results[base_index] or {}).get('report') or {}) if base_index is not None else {}
         if bad and all(bad):
-            base = best_cand or cands[0]
             shifts = cfg["frame_shifts_m"]
-            # Match the result to this exact fit, not another candidate on the same support.
-            base_index = next((i for i, c in enumerate(cands) if c is base), None)
-            if base_index is None:
-                base_index = next((i for i, c in enumerate(cands) if c == base), None)
-            rep = ((results[base_index] or {}).get('report') or {}) if base_index is not None else {}
             try:
                 import numpy as np
                 axis = np.asarray(base.get("support_axis_xy"), dtype=float)
@@ -513,7 +516,6 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
                         and np.isfinite(center).all() and np.isfinite(pelvis).all()
                         and np.isfinite(matrix).all() and math.isfinite(length) and length > 0
                         and np.linalg.norm(axis) > 0):
-                    # The pelvis includes existing body offsets; add only the required delta.
                     axis = axis / np.linalg.norm(axis)
                     shifts = [np.linalg.solve(matrix, center + axis * length * fraction / 3 - pelvis).tolist()
                               for fraction in cfg["frame_shifts_thirds"]]
@@ -523,6 +525,25 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
                 out.append(dict(base, variant=f"frame_shift{dx:+g},{dy:+g}",
                                 body_dx=float(base.get("body_dx") or 0.0) + dx,
                                 body_dy=float(base.get("body_dy") or 0.0) + dy, origin="derived"))
+        height = (rep.get('visual_metrics') or {}).get('height_fraction')
+        frame = cfg['frame']
+        direction = ('farther' if isinstance(height, (int, float)) and height > frame['height_max_frac'] else
+                     'closer' if isinstance(height, (int, float)) and height < frame['height_min_frac'] else None)
+        if base_index is not None and bad[base_index] and direction:
+            sign = 1.0 if direction == 'farther' else -1.0
+            for distance in cfg['frame_depth_shifts_m'][direction]:
+                dy = sign * float(distance)
+                out.append(dict(base, variant=f"frame_depth{dy:+g}",
+                                body_dy=float(base.get('body_dy') or 0.0) + dy, origin='derived'))
+        parts = set(str(base.get('support_parts') or '').split(','))
+        torso = (rep.get('contacts') or {}).get('torso') or {}
+        torso_gap = torso.get('gap_cm')
+        if ('torso' in parts and base.get('label') != 'floor' and
+                isinstance(torso_gap, (int, float)) and math.isfinite(torso_gap) and
+                torso_gap > cfg['recline_torso_gap_cm']):
+            for degrees in cfg['recline_pitch_shifts_deg']:
+                pitch = float(base.get('body_dpitch') or 0.0) + float(degrees)
+                out.append(dict(base, variant=f"recline_pitch{pitch:+g}", body_dpitch=pitch, origin='derived'))
     if "room_scale_suspect" in scale_flags and scale and cands:
         best = best_cand or cands[0]
         out.append(dict(best, variant="room_scale", height_m=round(best["height_m"] / scale, 3), origin="derived"))
@@ -606,9 +627,10 @@ def score(cand, status, rep, pose_class, cfg):
             dev += abs(_wrap(ang["plate"] - ang["ref"]))
     elif isinstance(rep.get("reference_pose_error_m"), (int, float)):
         dev = rep["reference_pose_error_m"] * s["ref_error_deg_per_m"]
-    yaw = abs(_wrap(float(cand.get("body_dyaw") or 0.0)))     # ручной поворот отчёт не пересчитывает в ракурсе
-    comp["pose_match"] = (math.exp(-(dev + yaw) / s["pose_scale_deg"]) if dev is not None else
-                          s["pose_unknown"] * math.exp(-yaw / s["pose_scale_deg"]))
+    transform_dev = sum(abs(float(cand.get(key) or 0.0)) for key in
+                        ("body_dyaw", "body_dpitch", "body_droll"))
+    comp["pose_match"] = (math.exp(-(dev + transform_dev) / s["pose_scale_deg"]) if dev is not None else
+                          s["pose_unknown"] * math.exp(-transform_dev / s["pose_scale_deg"]))
     rank = support_rank(pose_class, cand.get("label", "floor"), cfg) if pose_class != "auto" else None
     if pose_class == "auto":
         comp["support_class"] = s["support_unknown"]
