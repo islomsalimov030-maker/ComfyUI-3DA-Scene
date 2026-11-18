@@ -210,3 +210,43 @@ def test_cache_survives_location_dir_rewrite(monkeypatch, tmp_path):
     (loc.parent / 'objects_preview.png').write_bytes(b'new')
     s2, c2 = call(0)
     assert s2['cache'] == 'hit' and c2 == [] and s2['chosen'] == 0
+
+
+def test_cache_tracks_profile_geometry_and_referenced_resources(monkeypatch, tmp_path):
+    N = load_nodes()
+    loc = tmp_path / 'locations' / 'profile.json'
+    loc.parent.mkdir(parents=True)
+    grid = loc.parent / 'surface.npz'
+    profile = {'loc_id': 'room', 'objects': [{'id': 'surf_1', 'h0': 0.5, 'top_grid_npz': grid.name}],
+               'anchors': [], 't': 1}
+    loc.write_text(json.dumps(profile), encoding='utf-8')
+    np.savez_compressed(grid, origin=[0., 0.], mask=[[1, 1], [0, 0]])
+    monkeypatch.setenv('THREEDA_CAND_CACHE', str(tmp_path / 'cache'))
+
+    def call(pick):
+        execute, calls = fake_execute({'surf_1': 'wrong_surface', 'surf_4': 'ok'})
+        monkeypatch.setattr(N.PlacePose, 'execute', execute)
+        out = N.PlaceCandidates().execute(str(loc), torch.zeros((1, 8, 8, 3)), 'sit_edge', '', '', 2.30, '', 'grey',
+                                          1., 101, json.dumps(room()), n_candidates=4, pick=pick)
+        return json.loads(out[10]), calls
+
+    summary, calls = call(-1)
+    assert summary['cache'] == 'miss' and calls
+    profile['t'] = 2
+    loc.write_text(json.dumps(profile, indent=2), encoding='utf-8')
+    np.savez_compressed(grid, mask=[[1, 1], [0, 0]], origin=[0., 0.])
+    summary, calls = call(0)
+    assert summary['cache'] == 'hit' and not calls
+    profile['objects'][0]['h0'] = 0.6
+    loc.write_text(json.dumps(profile), encoding='utf-8')
+    summary, calls = call(-1)
+    assert summary['cache'] == 'miss' and calls
+    np.savez_compressed(grid, origin=[0., 0.], mask=[[1, 0], [0, 0]])
+    summary, calls = call(-1)
+    assert summary['cache'] == 'miss' and calls
+    (loc.parent / 'plate_mesh.obj').write_text('mesh 1', encoding='utf-8')
+    summary, calls = call(-1)
+    assert summary['cache'] == 'miss' and calls
+    (loc.parent / 'plate_mesh.obj').write_text('mesh 2', encoding='utf-8')
+    summary, calls = call(-1)
+    assert summary['cache'] == 'miss' and calls

@@ -1966,10 +1966,57 @@ class PlaceCandidates:
          n_candidates, block_on_fail, hint_json, pose_text, props, body_transform, megapixels, settings,
          variant_set, passport) = fields
         h = hashlib.sha256()
-        # Файлы кода, настроек, тела и предметов — как у 3DAPlacePose, но без папки локации: 3DALocation
-        # переписывает её при каждом своём прогоне (ComfyUI вытесняет его кэш чужими задачами), и ключ «плыл».
-        # Комнату задают путь профиля (auto_<хэш фото>) и её objects — оба входят в ключ ниже.
+        # Содержимое локации важно даже при неизменных пути и objects. Не хэшируем всю папку:
+        # превью и метаданные архивов могут переписываться без изменения сцены.
         h.update(PlacePose.fingerprint(None, props, body_json=body_json).encode('utf-8'))
+        if isinstance(location, str) and Path(location).is_file():
+            import zipfile
+
+            profile_path = Path(location)
+            profile_bytes = profile_path.read_bytes()
+            try:
+                profile = json.loads(profile_bytes)
+            except (ValueError, UnicodeDecodeError):
+                profile = None
+            if isinstance(profile, dict):
+                stable_profile = {k: v for k, v in profile.items() if k != 't'}
+                h.update(json.dumps(stable_profile, ensure_ascii=False, sort_keys=True,
+                                    separators=(',', ':')).encode('utf-8'))
+                resources = set()
+
+                def collect(value):
+                    if isinstance(value, dict):
+                        for key, item in value.items():
+                            if (key.endswith('_npz') or key == 'mask_png') and isinstance(item, str) and item:
+                                resources.add(profile_path.parent / item)
+                            collect(item)
+                    elif isinstance(value, list):
+                        for item in value:
+                            collect(item)
+
+                collect(profile)
+                # top_grid_npz может находиться и во входе objects, а не только в профиле.
+                try:
+                    collect(json.loads(objects) if isinstance(objects, str) else objects)
+                except ValueError:
+                    pass
+                assets = Path(config().get('location_asset_dirs', {}).get(profile.get('loc_id'), profile_path.parent))
+                resources.update(assets / name for name in
+                                 ('plate.json', 'plate_mesh.obj', 'plate_rgb.png', 'depth_loc.png', 'plate_photo.png'))
+                for path in sorted(resources, key=str):
+                    h.update(str(path).encode('utf-8'))
+                    if not path.is_file():
+                        h.update(b'\0missing\0')
+                    elif path.suffix.lower() == '.npz' and zipfile.is_zipfile(path):
+                        # ZIP хранит время упаковки; данные .npy в неизменной геометрии те же.
+                        with zipfile.ZipFile(path) as archive:
+                            for name in sorted(archive.namelist()):
+                                h.update(name.encode('utf-8'))
+                                h.update(archive.read(name))
+                    else:
+                        h.update(path.read_bytes())
+            else:
+                h.update(profile_bytes)
         ref = pose_ref.detach().cpu().float().numpy() if hasattr(pose_ref, 'detach') else np.asarray(pose_ref)
         h.update(str(ref.shape).encode('utf-8'))
         h.update(np.ascontiguousarray(ref).tobytes())
