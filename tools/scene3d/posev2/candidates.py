@@ -525,16 +525,19 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
                 out.append(dict(base, variant=f"frame_shift{dx:+g},{dy:+g}",
                                 body_dx=float(base.get("body_dx") or 0.0) + dx,
                                 body_dy=float(base.get("body_dy") or 0.0) + dy, origin="derived"))
-        height = (rep.get('visual_metrics') or {}).get('height_fraction')
         frame = cfg['frame']
-        direction = ('farther' if isinstance(height, (int, float)) and height > frame['height_max_frac'] else
-                     'closer' if isinstance(height, (int, float)) and height < frame['height_min_frac'] else None)
-        if base_index is not None and bad[base_index] and direction:
+        for cand, result in zip(cands, results):
+            cand_rep = (result or {}).get('report') or {}
+            height = (cand_rep.get('visual_metrics') or {}).get('height_fraction')
+            direction = ('farther' if isinstance(height, (int, float)) and height > frame['height_max_frac'] else
+                         'closer' if isinstance(height, (int, float)) and height < frame['height_min_frac'] else None)
+            if not direction:
+                continue
             sign = 1.0 if direction == 'farther' else -1.0
             for distance in cfg['frame_depth_shifts_m'][direction]:
                 dy = sign * float(distance)
-                out.append(dict(base, variant=f"frame_depth{dy:+g}",
-                                body_dy=float(base.get('body_dy') or 0.0) + dy, origin='derived'))
+                out.append(dict(cand, variant=f"frame_depth{dy:+g}",
+                                body_dy=float(cand.get('body_dy') or 0.0) + dy, origin='derived'))
         parts = set(str(base.get('support_parts') or '').split(','))
         torso = (rep.get('contacts') or {}).get('torso') or {}
         torso_gap = torso.get('gap_cm')

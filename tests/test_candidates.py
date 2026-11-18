@@ -149,7 +149,8 @@ def test_derived_frame_shifts_require_bad_frame_evidence():
     shifted = C.derived([cand], [{'report': bad}], CFG, 1, [], None, cand)
     assert len(shifted) == len(CFG['frame_shifts_m']) + len(CFG['frame_depth_shifts_m']['farther'])
     assert shifted[1]['support_id'] == 'surf_1' and shifted[1]['body_dx'] == CFG['frame_shifts_m'][1][0]
-    assert [x['body_dy'] for x in shifted[-2:]] == CFG['frame_depth_shifts_m']['farther']
+    assert [x['body_dy'] for x in shifted[-len(CFG['frame_depth_shifts_m']['farther']):]] == \
+        CFG['frame_depth_shifts_m']['farther']
 
 
 def test_derived_rotated_support_centers_fitted_pelvis_and_shifts_thirds():
@@ -189,6 +190,20 @@ def test_derived_depth_shifts_follow_frame_height():
     closer = C.derived([cand], [too_small], CFG, 1, [], None, cand)
     assert [x['body_dy'] for x in closer[-len(CFG['frame_depth_shifts_m']['closer']):]] == [
         0.1 - x for x in CFG['frame_depth_shifts_m']['closer']]
+
+
+def test_derived_depth_variant_is_created_for_each_small_candidate():
+    good = {'variant': 'support', 'support_id': 'surf_1', 'label': 'sofa', 'body_dx': 0., 'body_dy': 0.}
+    small = {'variant': 'support', 'support_id': 'surf_2', 'label': 'bench', 'body_dx': .2, 'body_dy': .3}
+    reports = [
+        {'report': {'visual_metrics': {'height_fraction': .5, 'cropped_edges': [], 'visible_fraction': .9}}},
+        {'report': {'visual_metrics': {'height_fraction': .1, 'cropped_edges': [], 'visible_fraction': .9}}},
+    ]
+    out = C.derived([good, small], reports, CFG, 2, [], None, good)
+    depth = [x for x in out if x['variant'].startswith('frame_depth')]
+    assert len(depth) == len(CFG['frame_depth_shifts_m']['closer'])
+    assert all(x['support_id'] == 'surf_2' for x in depth)
+    assert [x['body_dy'] for x in depth] == [.3 - d for d in CFG['frame_depth_shifts_m']['closer']]
 
 
 def test_derived_recline_pitch_variants_for_high_torso_gap():
