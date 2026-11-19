@@ -14,6 +14,13 @@ if __package__:
     except Exception as _exc:  # noqa: BLE001
         print(f'[3DA] пакетный вход (auto) не загружен: {_exc}')
 
+    # Независимая регистрация: старые маршруты и узлы не меняются.
+    try:
+        from .auto.secure_routes import register_server as _register_secure_routes
+        _register_secure_routes()
+    except Exception as _exc:  # noqa: BLE001
+        print(f'[3DA] безопасная выдача не загружена: {_exc}')
+
 WEB_DIRECTORY = './web'
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']
