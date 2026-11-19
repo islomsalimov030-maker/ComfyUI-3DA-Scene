@@ -250,3 +250,31 @@ def test_cache_tracks_profile_geometry_and_referenced_resources(monkeypatch, tmp
     (loc.parent / 'plate_mesh.obj').write_text('mesh 2', encoding='utf-8')
     summary, calls = call(-1)
     assert summary['cache'] == 'miss' and calls
+
+
+def test_cache_skips_transient_oom_fallback(monkeypatch, tmp_path):
+    """E12: fallback от CUDA OOM не попадает в кэш (иначе S19 получал пустой силуэт при свободной памяти)."""
+    N = load_nodes()
+    execute, calls = fake_execute({})
+
+    def oom_execute(self, *args, **kwargs):
+        outs = list(execute(self, *args, **kwargs))
+        outs[5] = 'status=fallback — 3DA не сработал: Error: Failed to retain CUDA context (Out of memory)\nx'
+        return tuple(outs)
+    monkeypatch.setattr(N.PlacePose, 'execute', oom_execute)
+    monkeypatch.setenv('THREEDA_CAND_CACHE', str(tmp_path / 'cache'))
+    args = ('missing/profile.json', torch.zeros((1, 8, 8, 3)), 'sit_edge', '', '', 2.30, '', 'grey', 1., 101,
+            json.dumps(room()))
+    out1 = N.PlaceCandidates().execute(*args, n_candidates=2)
+    assert json.loads(out1[10])['cache'] == 'off'
+    assert not list((tmp_path / 'cache').glob('*/summary.json'))
+    n1 = len(calls)
+    out2 = N.PlaceCandidates().execute(*args, n_candidates=2)       # память освободилась — считаем заново
+    assert len(calls) > n1 and json.loads(out2[10])['cache'] == 'off'
+
+
+def test_transient_failure_markers():
+    assert K.CandCache.transient_failure([{'status': 'fallback', 'error': 'Failed to retain CUDA context'}])
+    assert K.CandCache.transient_failure([{'status': 'fallback', 'error': 'CUDA Out of memory'}])
+    assert not K.CandCache.transient_failure([{'status': 'fallback', 'error': 'no_target: нет опоры'}])
+    assert not K.CandCache.transient_failure([{'status': 'ok', 'error': None}, {'status': 'skipped_time'}])

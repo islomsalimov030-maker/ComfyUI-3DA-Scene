@@ -1914,6 +1914,10 @@ class PlaceCandidates:
         if passport_info is not None:
             stored['passport'] = passport_info
         sheet = contact_sheet(tiles)
+        if cache is not None and cache.transient_failure(entries):
+            print('[3DA] кандидаты: сбой окружения (память/CUDA) — результат не кэшируется')
+            cache.abort()
+            cache, cache_note = None, 'off'
         if cache is not None:
             try:
                 cache.commit(stored, sheet)

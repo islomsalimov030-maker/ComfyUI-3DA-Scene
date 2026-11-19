@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 
 VERSION = 'e6-cache-v2'
+# сбой окружения (память GPU и т. п.), не свойство сцены: такую запись в кэш не кладём
+TRANSIENT_MARKERS = ('out of memory', 'cuda')
 
 
 def _torch():
@@ -124,6 +126,13 @@ class CandCache:
         os.replace(self.tmp, self.dir)
         self.tmp = None
         self.prune()
+
+    @staticmethod
+    def transient_failure(entries):
+        """E12: есть кандидат-fallback с ошибкой окружения (OOM/CUDA) — результат кэшировать нельзя:
+        повторный вызов получил бы тот же fallback, хотя память уже свободна."""
+        return any(e.get('status') == 'fallback'
+                   and any(m in str(e.get('error') or '').lower() for m in TRANSIENT_MARKERS) for e in entries)
 
     def abort(self):
         if self.tmp is not None:
