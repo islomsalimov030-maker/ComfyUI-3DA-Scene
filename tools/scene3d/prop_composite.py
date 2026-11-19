@@ -13,6 +13,15 @@ def alpha(strength):
                            sigma=8.,radius=8,mode='mirror')
 
 
+def paste_alpha(strength):
+    """0.3.46: альфа ВКЛЕЙКИ итога: жёсткое ядро внутри области (1.0), мягкий край — узкая полоса ~3 px
+    по контуру. До 0.3.46 вклейка брала alpha() с широким (≈14 px) градиентом: там, где H3 распускал
+    волосы/одежду за 3D-силу, итог подмешивал исходную комнату («прозрачные» части персонажа).
+    alpha() не меняется: его широкая полоса нужна repair_mask (восстановление фона вокруг предмета)."""
+    hard = binary_dilation(np.asarray(strength) > 0, iterations=4).astype(np.float32)
+    return np.maximum(gaussian_filter(hard, sigma=2., mode='mirror'), hard)
+
+
 def support(strength):
     return alpha(strength)>0
 

@@ -631,8 +631,13 @@ def clean_shadows(final, image, original, masks):
         return final, info
     area = area > 0
     # запас вокруг человека: маска с кадра H3 точная — узкий; силуэт рендера — шире (волосы, отличие позы у H3).
-    grow = max(2, int(round(h * (.006 if source == 'h3' else .02))))
-    keep = person > .5
+    # 0.3.46: при SAM3-маске силуэт рендера не отбрасывается, а объединяется с ней (порог 0 — мягкий край SAM3),
+    # иначе волосы/одежда за силуэтом манекена замещаются фото комнаты («прозрачные» части персонажа).
+    render = fit(masks.get('person_render'))
+    grow = max(2, int(round(h * (.006 if source == 'h3' and render is None else .02))))
+    keep = person > (0 if source == 'h3' else .5)
+    if render is not None:
+        keep |= render > .5
     prop = fit(masks.get('prop'))
     if prop is not None:
         keep |= prop > .05
@@ -663,11 +668,33 @@ def clean_shadows(final, image, original, masks):
     return torch.from_numpy(out.astype(np.float32))[None].to(final.device), info
 
 
+def person_paste(person_mask, size, device):
+    """0.3.46: маска человека с кадра H3 как жёсткое ядро вклейки: 1.0 внутри маски (порог 0 — мягкий край
+    SAM3 не подмешивает комнату в фигуру), мягкий край ~2 px по контуру. None, если маски нет."""
+    if not isinstance(person_mask, torch.Tensor) or person_mask.numel() == 0 or float(person_mask.max()) <= 0:
+        return None
+    import torch.nn.functional as F
+    from scipy.ndimage import binary_dilation, gaussian_filter
+    m = person_mask.detach().to(torch.float32).cpu()
+    m = m if m.ndim == 3 else m.reshape((1,) + tuple(m.shape[-2:]))
+    if tuple(m.shape[1:3]) != size:
+        m = F.interpolate(m[:, None], size=size, mode='bilinear', align_corners=False)[:, 0]
+    core = m[0].numpy() > 0
+    if not core.any():
+        return None
+    hard = binary_dilation(core, iterations=2).astype(np.float32)
+    soft = np.maximum(gaussian_filter(hard, sigma=1.5) * (hard > 0), hard)
+    return torch.from_numpy(np.clip(soft, 0, 1))[None].to(device)
+
+
 def clean_masks(g, support, person_mask=None):
     """0.3.12: маски для clean_shadows: область H3 (support), человек (SAM3 с кадра H3 или силуэт рендера), предмет."""
     masks = dict(g['clean_shadows'], area=support, prop=g.get('prop_alpha'))
     if isinstance(person_mask, torch.Tensor) and person_mask.numel() and float(person_mask.max()) > 0:
-        masks.update(person=person_mask, person_source='h3')
+        # 0.3.46: SAM3-маска не заменяет силуэт рендера, а дополняет — H3 часто рисует волосы/одежду
+        # за силуэтом манекена и с мягким краем у самой маски; замена делала их «тенью» (полупрозрачность).
+        masks.update(person=person_mask, person_source='h3',
+                     person_render=masks.get('person') if masks.get('person_source') == 'render' else None)
     return masks
 
 
@@ -1287,7 +1314,7 @@ class NativeComposite:
             return self.compose_h3(image, g, person_mask)
         import sys
         sys.path.insert(0, str(Path(config()['repo']) / 'tools/scene3d'))
-        from prop_composite import alpha, restore, outside_metrics, harmonize
+        from prop_composite import alpha, paste_alpha, restore, outside_metrics, harmonize
         import torch.nn.functional as F
         # 0.3.4: итог в растре H3 (МП из пульта), а не в 1344×768 plate_rgb: чистая комната — plate,
         # то же фото комнаты, уже пересчитанное в этот растр (LANCZOS из полного фото).
@@ -1298,7 +1325,7 @@ class NativeComposite:
         # generation needs a CLEAN room guard and one RGBA overlay. Applying
         # the already-coloured repair and then RGBA again doubles edge alpha.
         restore(g['plate'], prop_repair, prop_repair_mask)
-        body_alpha=torch.from_numpy(alpha(g['strength'].detach().cpu().numpy()[0]))[None].to(image.device)
+        body_alpha=torch.from_numpy(paste_alpha(g['strength'].detach().cpu().numpy()[0]))[None].to(image.device)
         guard=(prop_repair_mask.detach().cpu().numpy()[0]>0)&~(body_alpha.cpu().numpy()[0]>0)
         size=original.shape[1:3]
         def rgb(value):
@@ -1308,6 +1335,12 @@ class NativeComposite:
             value=value.to(image.device)
             return value if value.shape[1:3]==size else F.interpolate(value[:,None],size=size,mode='bilinear',align_corners=False)[:,0]
         body_alpha=mask(body_alpha)
+        # 0.3.46: как в compose_h3 — подключённая маска человека с кадра H3 расширяет жёсткое ядро
+        # вклейки (волосы/одежда за силуэтом манекена больше не подмешивают комнату).
+        person=person_paste(person_mask, size, image.device)
+        if person is not None:
+            person=mask(person)
+            body_alpha=torch.maximum(body_alpha,person)
         guard=mask(torch.from_numpy(guard.astype(np.float32))[None])>0
         guard &= ~(body_alpha>0)
         final=restore(original,rgb(image),body_alpha)
@@ -1374,9 +1407,15 @@ class NativeComposite:
         """0.3.6: тело и предмет нарисовал H3 (с тенями) — вне области силы возвращаем чистую комнату, без вклейки."""
         import sys
         sys.path.insert(0, str(Path(config()['repo']) / 'tools/scene3d'))
-        from prop_composite import alpha, restore, outside_metrics
+        from prop_composite import alpha, paste_alpha, restore, outside_metrics
         original = g['plate'].to(image.device)
-        support = torch.from_numpy(alpha(g['strength'].detach().cpu().numpy()[0]))[None].to(image.device)
+        support = torch.from_numpy(paste_alpha(g['strength'].detach().cpu().numpy()[0]))[None].to(image.device)
+        # 0.3.46: H3 может распустить фигуру за 3D-силу (волосы, одежда) — там мягкий хвост alpha
+        # подмешивал комнату в персонажа («прозрачные» части). Подключённая маска человека с кадра H3
+        # становится жёстким ядром вклейки: внутри неё итог = пиксели H3.
+        person = person_paste(person_mask, tuple(image.shape[1:3]), image.device)
+        if person is not None:
+            support = torch.maximum(support, person)
         final = restore(original, image, support)
         full = support > 0
         final = torch.where(full[..., None], final, original)
