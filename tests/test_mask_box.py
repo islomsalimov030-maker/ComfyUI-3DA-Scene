@@ -104,6 +104,17 @@ def test_place_candidates_outputs_are_paired_with_selected_silhouette(monkeypatc
         box = json.loads(text)
         assert not box['warning']
         boxes.append((box['x'], box['y'], box['w'], box['h']))
+        # При штатном соединении pick задаётся в источнике; -1 берёт его выбор.
+        _, auto_text, _ = module.MaskBox().execute(plate, outputs[10], outputs[3],
+                                                    margin=0, feather_px=0, min_frac=0)
+        assert json.loads(auto_text) == box
+        # Другой pick на приёмнике не может получить недоступный силуэт.
+        fallback_mask, mismatch, _ = module.MaskBox().execute(plate, outputs[10], outputs[3], pick=1-pick,
+                                                              margin=0, feather_px=0, min_frac=0)
+        mismatch_box = json.loads(mismatch)
+        assert 'силуэт доступен только' in mismatch_box['warning']
+        assert fallback_mask.sum() > 0
+        assert (mismatch_box['x'], mismatch_box['y'], mismatch_box['w'], mismatch_box['h']) != boxes[-1]
     assert boxes == [(10, 5, 10, 10), (30, 20, 10, 10)]
 
 
@@ -138,3 +149,19 @@ def test_missing_silhouette_is_not_misrepresented_as_candidate_bbox():
     plate, candidates, _ = inputs()
     _, text, _ = module.MaskBox().execute(plate, candidates)
     assert 'силуэт' in json.loads(text)['warning']
+
+
+def test_preprojected_silhouette_handles_different_raster_aspect():
+    plate, candidates, _ = inputs()
+    render_mask = torch.zeros((1, 48, 64))
+    render_mask[:, 5:15, 10:20] = 1
+    # Внешняя цепочка масштабирует нормализованный растр 3DA до плиты, без crop.
+    projected = torch.nn.functional.interpolate(render_mask[:, None], size=(100, 200),
+                                                mode='nearest-exact')[:, 0]
+    _, text, _ = module.MaskBox().execute(plate, candidates, projected,
+                                          margin=0, feather_px=0, min_frac=0)
+    box = json.loads(text)
+    ys, xs = torch.where(projected[0] > 0)
+    assert not box['warning']
+    assert (box['x'], box['y'], box['w'], box['h']) == (
+        int(xs.min()), int(ys.min()), int(xs.max()-xs.min()+1), int(ys.max()-ys.min()+1))
