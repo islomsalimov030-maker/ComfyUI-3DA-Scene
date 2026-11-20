@@ -17,14 +17,32 @@ import yaml
 
 CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "placement.yaml"
 STATUS_OK = ("ok", "partial")
+_SCREEN = []
 
 
 def load_config(path=None):
-    """Раздел candidates + размер ячейки сетки top_region (для масок поверхностей)."""
-    data = yaml.safe_load(Path(path or CONFIG_PATH).read_text(encoding="utf-8"))
+    """Раздел candidates + размер ячейки сетки top_region (для масок поверхностей) + E1c: screen — пороги проверки
+    «в кадре» из placement_screen.yaml рядом с файлом конфига (нет файла — проверки нет, как раньше)."""
+    path = Path(path or CONFIG_PATH)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     cfg = dict(data["candidates"])
     cfg["cell_m"] = float(data["top_region"]["cell"])
+    screen = path.with_name("placement_screen.yaml")
+    if screen.is_file():
+        cfg["screen"] = yaml.safe_load(screen.read_text(encoding="utf-8"))
     return cfg
+
+
+def screen_module():
+    """posev2/candidate_screen.py (этот файл узел грузит по пути, соседние модули по имени не импортируются)."""
+    if not _SCREEN:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("three_da_candidate_screen",
+                                                      Path(__file__).with_name("candidate_screen.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCREEN.append(module)
+    return _SCREEN[0]
 
 
 # ------------------------------------------------------------------------------------------------ входы
@@ -416,9 +434,13 @@ def _plan0(pose_class, objects, labels, hint, n, cfg, height_m, secondary_contac
     only_support (E6) — один кандидат на эту опору (variant «neighbor»)."""
     floor_id = floor_choice(objects, labels)
     objects_by_id = {o.get("id"): o for o in objects}
+    # E1c: есть ли в наборе опора по подсказке (target/expected_support); тогда другие опоры штрафуются в score()
+    hint_available = pose_class != "auto" and any(
+        s["hinted"] for s in supports_for(pose_class, objects, labels, hint, cfg, include_spare=True))
 
     def cand(variant, support, **kw):
         c = {"variant": variant, "target_object": support["type"] if support else "floor",
+             "hinted": bool(support and support.get("hinted")), "hint_available": hint_available,
              "instance_hint": support["id"] if support else "", "support_id": support["id"] if support else None,
              "label": support["label"] if support else "floor", "secondary_contacts": secondary_contacts,
              "support_parts": ",".join(cfg.get("lie_contact_support_parts", []))
@@ -492,8 +514,10 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
             rep = (result or {}).get("report") or {}
             height_score, crop_score = frame_components(rep, cfg)
             visible = visibility_fraction(rep)
-            bad.append(height_score == 0.0 or crop_score == 0.0 or
+            screen = rep.get("screen") if isinstance(rep.get("screen"), dict) else {}
+            bad.append(height_score == 0.0 or crop_score == 0.0 or screen.get("frame_ok") is False or
                        (visible is not None and visible < cfg["visibility"]["min_visible_frac"]))
+        out += screen_frame_variants(cands, results, cfg)
         base = best_cand or cands[0]
         base_index = next((i for i, c in enumerate(cands) if c is base), None)
         if base_index is None:
@@ -541,9 +565,12 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
         parts = set(str(base.get('support_parts') or '').split(','))
         torso = (rep.get('contacts') or {}).get('torso') or {}
         torso_gap = torso.get('gap_cm')
-        if ('torso' in parts and base.get('label') != 'floor' and
-                isinstance(torso_gap, (int, float)) and math.isfinite(torso_gap) and
-                torso_gap > cfg['recline_torso_gap_cm']):
+        # E1c: торс висит по карте глубины, а таз лежит (вертикальный settle тут утопил бы таз) — наклон, в том числе на полу
+        screen_torso = (bool(cfg.get('screen')) and isinstance(rep.get('screen'), dict) and
+                        screen_module().torso_floats_while_others_rest(rep['screen'], cfg['screen']))
+        if ('torso' in parts and (base.get('label') != 'floor' or screen_torso) and
+                (screen_torso or (isinstance(torso_gap, (int, float)) and math.isfinite(torso_gap) and
+                                  torso_gap > cfg['recline_torso_gap_cm']))):
             for degrees in cfg['recline_pitch_shifts_deg']:
                 pitch = float(base.get('body_dpitch') or 0.0) + float(degrees)
                 out.append(dict(base, variant=f"recline_pitch{pitch:+g}", body_dpitch=pitch, origin='derived'))
@@ -553,7 +580,47 @@ def derived(cands, results, cfg, n_max, scale_flags, scale, best_cand=None):
     return out
 
 
+def screen_frame_variants(cands, results, cfg):
+    """E1c: кандидат, которого проверка «в кадре» признала обрезанным (in_frame_frac < порога или голова вне кадра),
+    — тот же кандидат, сдвинутый на минимальное смещение, возвращающее тело в кадр (frame_fix_dxdy_m, вправо/вглубь,
+    м). Масштаб фигуры не меняется. Не больше screen.frame_fix.max_variants."""
+    screen_cfg = cfg.get("screen")
+    if not screen_cfg:
+        return []
+    out = []
+    for c, r in zip(cands, results):
+        screen = ((r or {}).get("report") or {}).get("screen")
+        fix = screen.get("frame_fix_dxdy_m") if isinstance(screen, dict) else None
+        if not (isinstance(screen, dict) and screen.get("frame_ok") is False and isinstance(fix, list) and len(fix) == 2):
+            continue
+        if len(out) >= int(screen_cfg["frame_fix"]["max_variants"]):
+            break
+        dx, dy = float(fix[0]), float(fix[1])
+        out.append(dict(c, variant=f"{c['variant']}|screen_frame{dx:+g},{dy:+g}",
+                        body_dx=float(c.get("body_dx") or 0.0) + dx, body_dy=float(c.get("body_dy") or 0.0) + dy,
+                        origin="derived"))
+    return out
+
+
+def screen_retry(cand, cfg, rep):
+    """E1c: settle по карте глубины — кандидат висит (или утоплен) на медианный вертикальный зазор контакта:
+    то же место, сдвинутое по вертикали (body_dz), не больше screen.settle.rounds раз."""
+    screen_cfg = cfg.get("screen")
+    if not screen_cfg or not isinstance(rep, dict) or cand.get("screen_settled", 0) >= screen_cfg["settle"]["rounds"]:
+        return []
+    dz = screen_module().settle_dz(rep.get("screen"), screen_cfg)
+    if dz is None:
+        return []
+    return [dict(cand, variant=cand["variant"] + "+screen", body_dz=round(float(cand.get("body_dz") or 0.0) + dz, 4),
+                 screen_settled=cand.get("screen_settled", 0) + 1, origin="retry")]
+
+
 def retries(cand, place_status, flags, cfg, status=None, rep=None, pose_class=None):
+    """Повторы того же места: сначала по опоре (мебель, ниже), затем E1c — settle по карте глубины (и для пола)."""
+    return _support_retries(cand, place_status, flags, cfg, status, rep, pose_class) or screen_retry(cand, cfg, rep)
+
+
+def _support_retries(cand, place_status, flags, cfg, status=None, rep=None, pose_class=None):
     """Повторы того же места (мебель):
     1) no_target из-за zone_too_small (маска опоры меньше следа тела) — мягкая зона (candidates_cli:
        e1_zone_min_frac = cfg.zone_relax_frac) и опорные части cfg.zone_relax_support_parts[класс] (видимый кусок
@@ -655,6 +722,15 @@ def score(cand, status, rep, pose_class, cfg):
     total_w = sum(w.values())
     # без постановки (fallback, no_target) итог 0: верная метка опоры не делает пустой вариант лучше реального
     value = sum(w[k] * comp[k] for k in w) / total_w if total_w and comp["status"] > 0 else 0.0
+    screen_cfg = cfg.get("screen")
+    if screen_cfg and status != "fallback":
+        # E1c: проверка «в кадре» и опора по подсказке — множители итога (веса placement.yaml не меняются)
+        factor, extra = screen_module().score_factor(rep.get("screen"), screen_cfg)
+        if cand.get("hint_available") and not cand.get("hinted"):
+            factor *= float(screen_cfg["hint_mismatch_factor"])
+            extra["hint_mismatch"] = 1.0
+        comp.update(extra)
+        value *= factor
     return round(value, 4), {k: round(v, 3) for k, v in comp.items()}
 
 

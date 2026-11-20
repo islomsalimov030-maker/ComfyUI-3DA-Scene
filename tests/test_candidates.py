@@ -249,8 +249,10 @@ def test_score_ranking_and_pick():
     s_fb, _ = C.score(sofa, 'fallback', {}, 'sit_edge', CFG)
     assert 0 <= s_fb < s_wrong < s_partial < s_ok <= 1
     assert s_bed < s_ok                                   # та же постановка, но опора ниже в списке класса
+    # E1c: отчёт без измерения «в кадре» — ошибка измерения (screen_measured 0), не идеал
     assert set(comp) == {'status', 'gap', 'penetration', 'pose_match', 'support_class', 'visibility',
-                         'frame_height', 'crop', 'depth'}
+                         'frame_height', 'crop', 'depth', 'screen_factor', 'screen_measured'}
+    assert comp['screen_measured'] == 0.0 and comp['screen_factor'] == CFG['screen']['measure_error_factor']
     def visual(height, edges, visible=1.0):
         return {**rep('ok'), 'visual_metrics': {'height_fraction': height, 'cropped_edges': edges,
                                                 'visible_fraction': visible}}

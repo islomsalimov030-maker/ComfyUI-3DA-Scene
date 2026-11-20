@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-VERSION = 'e6-cache-v2'
+VERSION = 'e1c-cache-v3'
 # сбой окружения (память GPU и т. п.), не свойство сцены: такую запись в кэш не кладём
 TRANSIENT_MARKERS = ('out of memory', 'cuda')
 

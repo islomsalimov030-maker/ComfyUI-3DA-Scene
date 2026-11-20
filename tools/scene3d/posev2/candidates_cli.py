@@ -230,12 +230,41 @@ def add_visual_metrics(config, result):
     return result
 
 
+def add_screen_metrics(request, config, result):
+    """E1c: измерение «в кадре» (кадр, висит/утоплен по карте глубины) в отчёт кандидата: report['screen'].
+    Сбой измерения пишется в screen.measure_error и штрафуется оценкой, а не пропускается."""
+    report = result.get('report') if isinstance(result, dict) else None
+    if not isinstance(report, dict):
+        return result
+    try:
+        import candidate_screen
+        cfg = candidate_screen.load_config()
+        silhouette = result.get('silhouette')
+        if not silhouette:
+            raise ValueError('нет рендера кандидата: каталог результата неизвестен')
+        job = Path(silhouette).parent.parents[1]
+        pf, _ = pack_cli.modules(config)
+        plate = pf.Plate(result['scene_setup']['plate_dir'])
+        report['screen'] = candidate_screen.measure_job(job, plate, request.get('pose_class'),
+                                                        request.get('support_parts'), cfg)
+    except Exception as exc:  # noqa: BLE001
+        report['screen'] = {'measure_error': [f'{type(exc).__name__}: {exc}'], 'auto_flag': 'measure_error',
+                            'contact_status': 'unknown', 'frame_ok': None}
+    flags = set(report.get('flags') or [])
+    for name in str(report['screen'].get('auto_flag') or '').split('+'):
+        if name not in ('', 'ok'):
+            flags.add('screen_' + name)
+    report['flags'] = sorted(flags)
+    return result
+
+
 def geometry_worker(request, config):
     captured = {}
     patch(request, config, captured)
     try:
         result = add_support_depth(request, config, pack_cli.do_place(request, config))
-        return add_visual_metrics(config, result)
+        result = add_visual_metrics(config, result)
+        return add_screen_metrics(request, config, result)
     except Exception as exc:
         result = pack_cli.error_result(exc)
         if captured.get("report") is not None:

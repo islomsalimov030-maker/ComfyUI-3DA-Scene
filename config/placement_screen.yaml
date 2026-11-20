@@ -1,0 +1,57 @@
+# E1c: числовая проверка «в кадре» для 3DAPlaceCandidates (кадр и «висит/утоплен» по карте глубины локации).
+# Читает только posev2/candidate_screen.py и раздел screen в candidates.load_config(). config/placement.yaml,
+# замороженные узлы и 3DAPlacePose этот файл не видят.
+
+# Кадр: доля вершин тела внутри картинки с полем frame_pad (доля стороны с каждого края); голова — все её вершины.
+frame_pad: 0.02
+min_in_frame_frac: 0.97
+head_required: true
+
+# Контакт: точки контакта обязательных частей тела проецируются в пиксели; глубина от камеры сравнивается с картой
+# глубины локации (Plate.Z) в этих пикселях. Зазор (метры, × room_scale) > floating_gap_m — висит,
+# < −penetrating_gap_m — утоплено. Зазор по лучу камеры, не по нормали: загораживающий предмет спереди даёт ложное
+# «утоплено», поэтому penetrating штрафуется мягче.
+floating_gap_m: 0.06
+penetrating_gap_m: 0.06
+contact_band_m: 0.03            # точки контакта части: вершины не выше самой низкой вершины части + band
+contact_min_points: 5           # меньше — берём 5 самых низких вершин части
+contact_min_valid_frac: 0.6     # доля точек с валидной глубиной; меньше — measure_error
+room_scale_default: 1.0         # у паспорта часто room_scale=null: единицы плиты считаем метрами (MoGe), это пишется в отчёт
+
+# Какие части тела — обязательные для контакта, по классу позы (имена регионов body.regions()).
+# lie/recline берут support_parts запроса (cfg.candidates.lie_contact_support_parts), если они заданы.
+contact_parts:
+  stand: [foot.L, foot.R]
+  crouch: [foot.L, foot.R]
+  sit_edge: [pelvis]
+  sit_tucked: [pelvis]
+  sit_floor: [pelvis]
+  lie: [pelvis, torso]
+  recline: [pelvis, torso]
+  kneel: [knee.L, knee.R]
+  all_fours: [knee.L, knee.R]
+lowest_only: [stand, crouch]    # стопа: только та, что ниже (поднятая нога не обязана касаться опоры)
+
+# Оценка кандидата: итог умножается на фактор за каждую найденную проблему.
+frame_fail_factor: 0.5
+floating_factor: 0.5
+penetrating_factor: 0.8
+measure_error_factor: 0.5
+hint_mismatch_factor: 0.6       # есть опора по подсказке (target/expected_support), а кандидат на другой опоре
+
+# Settle по карте глубины: сдвиг по вертикали (body_dz) на медианный вертикальный зазор.
+settle:
+  target_m: 0.01                # после сдвига оставить зазор
+  max_down_m: 0.35
+  max_up_m: 0.05
+  min_m: 0.01                   # меньший сдвиг не делаем
+  rounds: 2
+
+# Альтернатива по кадру: минимальный сдвиг тела в плоскости пола (вдоль камеры «дальше», вбок), который возвращает
+# тело в кадр. Масштаб фигуры не меняется (рост — паспорт персонажа).
+frame_fix:
+  step_m: 0.1
+  max_away_m: 2.5
+  lateral_m: [0.0, 0.25, -0.25, 0.5, -0.5, 1.0, -1.0]
+  max_variants: 2
+  sample_vertices: 3000
