@@ -846,10 +846,20 @@ def do_place(request, config):
     import raster
     size = raster.raster_for(request.get("megapixels", 0))
     timings["raster"] = list(size)
+    # E14: ручной сдвиг/поворот из 3D-окна — манекен в рендере стоит на той же высоте, что в окне: контактная посадка
+    # базовой постановки переносится вместе с телом, а не пересчитывается по сдвинутому MHR (давало ±1…4 см).
+    # Правки ручек позы (IK) и старые постановки без запомненной посадки — как раньше.
+    carry = []
+    if moved and not pose_edits and body_model == "mpfb":
+        import manual_contact
+        vector = manual_contact.carry_vector(cache_dir, lambda X, KP: manual_pose.transform(X, KP, plate, values)[0], base["KP"])
+        if vector is not None:
+            carry = ["--contact-carry=" + ",".join(repr(float(x)) for x in vector)]   # «=»: вектор может начинаться с «-»
+            timings["contact_carry_m"] = [round(float(x), 5) for x in vector]
     run_stage(threeda_blender.command(config, HERE / "plate/render_plate_scene.py", ["--plate", plate_dir, "--spec", job / "render_spec.json",
                "--mannequin", mannequin, "--out", job / "render", "--label-pass", "--photo-emission", "2.5",
                "--samples", "48", "--raster", f"{size[0]}x{size[1]}",
-               "--body-model", body_model]), "Blender render", env=env)
+               "--body-model", body_model, *carry]), "Blender render", env=env)
     timings["render_s"] = round(time.monotonic() - stage, 3)
     directory = job / "render/pose"
     # 14.11: the render body is Stacy's MPFB mannequin posed onto the MHR placement (render/pose/body_render.obj);
@@ -860,6 +870,9 @@ def do_place(request, config):
     if render_body.name == "body_render.obj" and not moved:
         from shutil import copy2 as _copy
         _copy(render_body, mpfb_base)
+        if (directory / "body_model.json").is_file():
+            import manual_contact
+            manual_contact.save_base_contact(cache_dir, read_json(directory / "body_model.json"))
     if (directory / "body_model.json").is_file():
         fit["body_model"] = read_json(directory / "body_model.json")
         if fit["body_model"].get("warning"):

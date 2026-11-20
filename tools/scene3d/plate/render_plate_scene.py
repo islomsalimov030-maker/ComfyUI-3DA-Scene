@@ -72,6 +72,8 @@ def args():
     ap.add_argument("--raster", default="", help="0.2.0: render WxH (same framing; intrinsics are normalised)")
     ap.add_argument("--body-model", choices=("mpfb", "mhr"), default="mpfb",
                     help="14.11: mpfb = Stacy's MPFB mannequin posed onto the placed MHR body; mhr = the MHR mesh itself")
+    ap.add_argument("--contact-carry", default="",
+                    help="E14: x,y,z (м) — контактный сдвиг манекена базовой постановки, перенесённый ручным сдвигом из 3D-окна")
     ap.add_argument("--photo-emission", type=float, default=None,
                     help="override light.photo_emission (0 = the 05.11 playblast, 1.5 = photo-lit clay)")
     return ap.parse_args(argv)
@@ -646,7 +648,8 @@ def _run_body_obj(a, sc, info, cam, plate, light, out, scene, chars):
             mpfb = bpy.data.objects.get("stacy_body") or max((o for o in chars if o.type == "MESH"),
                                                               key=lambda o: len(o.data.vertices))
             verts = np.array([tuple(body.matrix_world @ v.co) for v in body.data.vertices])
-            posed, model = pose_tools.pose_mannequin_to_mhr(rig, mpfb, kp, verts, plate)
+            carry = tuple(float(x) for x in a.contact_carry.split(",")) if getattr(a, "contact_carry", "") else None
+            posed, model = pose_tools.pose_mannequin_to_mhr(rig, mpfb, kp, verts, plate, contact_carry=carry)
             body.name = "body_mhr"
             body.hide_render = body.hide_viewport = True
             posed.pass_index = 1
