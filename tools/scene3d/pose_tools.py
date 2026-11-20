@@ -631,14 +631,17 @@ def contact_shift(bvh, V, mesh, report, band=0.02, sample=4000):
     if not np.isfinite(cp).any():
         return 0.
     dz = float(np.nanmedian(cm[touch]) - np.nanmedian(cp))
-    report.update(contact_dz_m=round(dz, 4), clearance_mhr_m=round(float(low), 4), contact_points=int(len(touch)))
+    report.update(contact_dz_m=round(dz, 4), contact_dz_exact_m=dz, clearance_mhr_m=round(float(low), 4),
+                  contact_points=int(len(touch)))
     return dz
 
 
-def pose_mannequin_to_mhr(rig, body, kp, mhr_verts=None, plate=None, subsurf=1, scale_limits=(0.85, 1.15)):
+def pose_mannequin_to_mhr(rig, body, kp, mhr_verts=None, plate=None, subsurf=1, scale_limits=(0.85, 1.15), contact_carry=None):
     """Pose + place the MPFB mannequin on the MHR placement; return a static world mesh object (body_v2) and a report.
 
-    kp: MHR70 joints (world, 70x3). mhr_verts: placed MHR vertices (world) for the contact height; plate: room mesh."""
+    kp: MHR70 joints (world, 70x3). mhr_verts: placed MHR vertices (world) for the contact height; plate: room mesh.
+    contact_carry: E14, вектор контактного сдвига базовой постановки, перенесённый ручным сдвигом из 3D-окна —
+    берётся вместо пересчёта по сдвинутому MHR (None = пересчёт, как раньше)."""
     import numpy as np
     report = {"model": "mpfb", "removed": prepare_mannequin(rig, body)}
     hidden = [(o, o.hide_viewport) for o in (rig, body)]
@@ -684,10 +687,14 @@ def pose_mannequin_to_mhr(rig, body, kp, mhr_verts=None, plate=None, subsurf=1, 
     # contact: where the MHR body touches the room mesh (its lowest clearance band), the mannequin's nearest
     # surface gets the same clearance -> feet on the floor, seat on the seat, side on the bed (vertical shift only)
     if plate is not None and mhr_verts is not None:
-        dz = contact_shift(plate_bvh(plate), np.asarray(mhr_verts, float), mesh, report)
-        if dz:
-            mesh.transform(Matrix.Translation((0, 0, dz)))
-            rig.location.z += dz
+        import manual_contact
+        shift, dz, source = manual_contact.contact_translation(
+            contact_carry, lambda: contact_shift(plate_bvh(plate), np.asarray(mhr_verts, float), mesh, report))
+        if shift is not None:
+            mesh.transform(Matrix.Translation(shift))
+            rig.location += Vector(shift)
+        if source == 'base':
+            report.update(contact_dz_m=round(dz, 4), contact_source='base')
     obj = bpy.data.objects.new("body_v2", mesh)
     bpy.context.scene.collection.objects.link(obj)
     for poly in mesh.polygons:

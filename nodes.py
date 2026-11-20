@@ -634,7 +634,8 @@ def clean_shadows(final, image, original, masks):
     # 0.3.46: при SAM3-маске силуэт рендера не отбрасывается, а объединяется с ней (порог 0 — мягкий край SAM3),
     # иначе волосы/одежда за силуэтом манекена замещаются фото комнаты («прозрачные» части персонажа).
     render = fit(masks.get('person_render'))
-    grow = max(2, int(round(h * (.006 if source == 'h3' and render is None else .02))))
+    # Запас узкий (как у SAM3 до 0.3.46): широкий запас оставлял H3-шум в полосе вокруг персонажа.
+    grow = max(2, int(round(h * (.006 if source == 'h3' else .02))))
     keep = person > (0 if source == 'h3' else .5)
     if render is not None:
         keep |= render > .5
@@ -663,6 +664,10 @@ def clean_shadows(final, image, original, masks):
     shaded = original[0].detach().cpu().numpy() * ratio[..., None]
     out = final[0].detach().cpu().numpy() * (1 - weight[..., None]) + shaded * weight[..., None]
     dark = (ratio < .97) & region
+    if source != 'h3':
+        # нет маски человека с кадра H3 (SAM3 «person» не подключена или пуста): человека задаёт только силуэт манекена,
+        # волосы/одежда за ним (до ~20% волос на светлом фоне) заменяются комнатой — «прозрачные» части персонажа
+        info['warning'] = '3DA: «чистые тени» без маски SAM3 «person» — волосы и одежда за силуэтом манекена могут стать полупрозрачными; подключите SAM3 «person» к вклейке'
     info.update(applied=True, ratio_sigma_px=round(float(sigma), 1), darkened_px=int(dark.sum()),
                 mean_ratio_in_shadow=round(float(ratio[dark].mean()), 3) if dark.any() else None)
     return torch.from_numpy(out.astype(np.float32))[None].to(final.device), info
@@ -1378,6 +1383,8 @@ class NativeComposite:
                        appearance_validation='requires visual review')
         if clean_info is not None:
             metrics['clean_shadows']=clean_info
+            if clean_info.get('warning'):
+                metrics['warning']=clean_info['warning']
         if not metrics['outside_passed']:
             metrics['warning']='3DA: вклейка изменила фон сильнее допуска — проверьте кадр глазами'
         return final,full_support.float().cpu(),json.dumps(metrics)
@@ -1429,6 +1436,8 @@ class NativeComposite:
                        appearance_validation='requires visual review')
         if clean_info is not None:
             metrics['clean_shadows'] = clean_info
+            if clean_info.get('warning'):
+                metrics['warning'] = clean_info['warning']
         if not metrics['outside_passed']:
             metrics['warning'] = '3DA: вклейка изменила фон сильнее допуска — проверьте кадр глазами'
         return final, full.float().cpu(), json.dumps(metrics)

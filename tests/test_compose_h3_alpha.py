@@ -105,6 +105,31 @@ def test_compose_h3_shadow_still_works():
     assert .4 < float(ratio) < .95, 'тень должна остаться затемнением комнаты'
 
 
+def test_compose_h3_noise_band_around_person_stays_clean_with_sam3():
+    """С маской SAM3 запас у фигуры узкий (как до 0.3.46): H3-шум в полосе вокруг персонажа заменяется чистой комнатой."""
+    h3, guides = scene()
+    noise = (torch.rand(1, H, W, 3, generator=torch.Generator().manual_seed(3)) - .5) * .12
+    h3 = (h3 + noise).clamp(0, 1)
+    sam = torch.zeros(1, H, W)
+    sam[0][BODY] = 1
+    final, _, _ = N.NativeComposite().compose_h3(h3.clone(), guides, person_mask=sam)
+    band = torch.zeros(H, W, dtype=torch.bool)
+    band[BODY[0].start - 18:BODY[0].start - 6, BODY[1].start:BODY[1].stop] = True      # над телом, 6–18 px от силуэта
+    raw = (h3[0] - ROOM[0]).abs().mean(-1)[band].mean()
+    cleaned = (final[0] - ROOM[0]).abs().mean(-1)[band].mean()
+    assert cleaned < .5 * raw, f'шум H3 в полосе вокруг персонажа не очищен: {float(cleaned):.4f} vs {float(raw):.4f}'
+
+
+def test_clean_shadows_without_sam3_warns():
+    h3, guides = scene()
+    _, _, metrics = N.NativeComposite().compose_h3(h3.clone(), guides)
+    assert 'SAM3' in json_metrics(metrics)['clean_shadows'].get('warning', '')
+    sam = torch.zeros(1, H, W)
+    sam[0][BODY] = 1
+    _, _, metrics = N.NativeComposite().compose_h3(h3.clone(), guides, person_mask=sam)
+    assert 'warning' not in json_metrics(metrics)['clean_shadows']
+
+
 def json_metrics(metrics):
     import json
     return json.loads(metrics)
