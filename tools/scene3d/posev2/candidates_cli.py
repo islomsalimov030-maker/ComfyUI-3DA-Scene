@@ -247,6 +247,7 @@ def add_screen_metrics(request, config, result):
         plate = pf.Plate(result['scene_setup']['plate_dir'])
         report['screen'] = candidate_screen.measure_job(job, plate, request.get('pose_class'),
                                                         request.get('support_parts'), cfg)
+        report['screen']['job'] = job.name                  # каталог результата в <farm>/pack/jobs — для разбора
     except Exception as exc:  # noqa: BLE001
         report['screen'] = {'measure_error': [f'{type(exc).__name__}: {exc}'], 'auto_flag': 'measure_error',
                             'contact_status': 'unknown', 'frame_ok': None}

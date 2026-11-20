@@ -96,7 +96,7 @@ def test_small_gap_below_threshold_is_not_floating_and_no_settle():
 
 def test_gap_scaled_by_room_scale_and_recorded():
     plate = FakePlate()
-    X, reg = lying_body(z=0.012)
+    X, reg = lying_body(z=0.03)
     base = S.measure(plate, X, reg, 'lie', [], CFG)
     scaled = S.measure(plate, X, reg, 'lie', [], CFG, room_scale=3.0)
     assert base['scale_source'] == 'plate_units' and scaled['scale_source'] == 'room_scale'
@@ -275,3 +275,14 @@ def test_mixed_parts_no_vertical_settle_but_tilt_variants():
     assert not S.torso_floats_while_others_rest(whole, CFG)
     assert not [c for c in C.derived([cand], [{'report': {'screen': whole}}], CAND, 1, [], None, cand)
                 if c['variant'].startswith('recline_pitch')]
+
+
+def test_gap_basis_vertical_ignores_grazing_angle_amplification():
+    """Камера вровень с поверхностью: 3 см высоты дают >6 см разницы глубин — висит только по основанию «depth»."""
+    plate = FakePlate(pitch_deg=6.0)
+    X, reg = lying_body(z=0.03, cy=5.0)
+    vertical = S.measure(plate, X, reg, 'lie', [], CFG)
+    depth = S.measure(plate, X, reg, 'lie', [], dict(CFG, gap_basis='depth'))
+    assert vertical['screen_gap_m'] > CFG['floating_gap_m'] and vertical['vertical_gap_m'] == pytest.approx(0.03, abs=0.01)
+    assert vertical['contact_status'] == 'contact'
+    assert depth['contact_status'] == 'floating' and S.settle_dz(depth, dict(CFG, gap_basis='depth')) is not None

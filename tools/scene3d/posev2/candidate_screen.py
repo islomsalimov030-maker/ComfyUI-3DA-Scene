@@ -9,7 +9,10 @@
 (в) любая ошибка измерения пишется в measure_error и штрафуется, идеалом не считается.
 
 Зазор по лучу — не нормаль: загораживающий предмет перед телом даёт ложное «утоплено», ошибки карты глубины —
-ложный зазор. Пороги и факторы — config/placement_screen.yaml; place.py и 3DAPlacePose не затрагиваются.
+ложный зазор; при взгляде вскользь (камера почти вровень с поверхностью) разница глубин в 5–7 раз больше высоты, поэтому
+статус (висит/утоплено) и settle берутся по vertical_gap_m (cfg.gap_basis = vertical), а screen_gap_m — как есть, для
+отчёта и сравнения (gap_basis = depth возвращает решение по глубине). Пороги и факторы — config/placement_screen.yaml;
+place.py и 3DAPlacePose не затрагиваются.
 Plate — любой объект с R (мир←камера CV), C, fx, cx, cy, Wp, Hp, Z и project(X) -> (u, v, z) (pose_fit.Plate).
 """
 import math
@@ -155,21 +158,27 @@ def part_gaps(plate, points, scale, cfg):
     return rec
 
 
+def gap_of(rec, cfg):
+    """Зазор части, по которому принимается решение: vertical_gap_m (по умолчанию) или screen_gap_m (gap_basis)."""
+    return rec["screen_gap_m"] if cfg.get("gap_basis") == "depth" else rec["vertical_gap_m"]
+
+
 def contact_status(parts, cfg):
-    """(статус, screen_gap_m, vertical_gap_m): floating | penetrating | contact | unknown (нет ни одной части)."""
+    """(статус, screen_gap_m, vertical_gap_m): floating | penetrating | contact | unknown (нет ни одной части).
+    Решает худшая часть по gap_of; зазоры в ответе — у решающей части (при контакте — медианы частей)."""
     done = [r for r in parts.values() if r["measure_error"] is None]
     if not done:
         return "unknown", None, None
-    gaps = [r["screen_gap_m"] for r in done]
-    high, low = max(gaps), min(gaps)
+    high, low = max(gap_of(r, cfg) for r in done), min(gap_of(r, cfg) for r in done)
     if high > float(cfg["floating_gap_m"]):
-        status, pick = "floating", max(done, key=lambda r: r["screen_gap_m"])
+        status, pick = "floating", max(done, key=lambda r: gap_of(r, cfg))
     elif low < -float(cfg["penetrating_gap_m"]):
-        status, pick = "penetrating", min(done, key=lambda r: r["screen_gap_m"])
+        status, pick = "penetrating", min(done, key=lambda r: gap_of(r, cfg))
     else:
         status, pick = "contact", None
     if pick is None:
-        return status, round(float(np.median(gaps)), 4), round(float(np.median([r["vertical_gap_m"] for r in done])), 4)
+        return (status, round(float(np.median([r["screen_gap_m"] for r in done])), 4),
+                round(float(np.median([r["vertical_gap_m"] for r in done])), 4))
     return status, pick["screen_gap_m"], pick["vertical_gap_m"]
 
 
@@ -272,9 +281,9 @@ def settle_dz(screen, cfg):
     if not done:
         return None
     s = cfg["settle"]
-    if all(r["screen_gap_m"] > float(cfg["floating_gap_m"]) for r in done):
+    if all(gap_of(r, cfg) > float(cfg["floating_gap_m"]) for r in done):
         dz = -min(max(min(r["vertical_gap_m"] for r in done) - float(s["target_m"]), 0.0), float(s["max_down_m"]))
-    elif all(r["screen_gap_m"] < -float(cfg["penetrating_gap_m"]) for r in done):
+    elif all(gap_of(r, cfg) < -float(cfg["penetrating_gap_m"]) for r in done):
         dz = min(max(-max(r["vertical_gap_m"] for r in done) + float(s["target_m"]), 0.0), float(s["max_up_m"]))
     else:
         return None
@@ -286,7 +295,7 @@ def floating_parts(screen, cfg):
     parts = (screen or {}).get("parts") if isinstance(screen, dict) else None
     return [name for name, r in (parts or {}).items()
             if isinstance(r, dict) and r.get("measure_error") is None
-            and isinstance(r.get("screen_gap_m"), (int, float)) and r["screen_gap_m"] > float(cfg["floating_gap_m"])]
+            and isinstance(r.get("screen_gap_m"), (int, float)) and gap_of(r, cfg) > float(cfg["floating_gap_m"])]
 
 
 def torso_floats_while_others_rest(screen, cfg):
