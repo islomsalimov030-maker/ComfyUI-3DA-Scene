@@ -136,7 +136,7 @@ export function twoBone(a, b, c, target, poleHint, eps, straightDeg = 180, hintS
       dot(sub(a, b2), sub(c2, b2)) / (l1 * l2)))) * 180 / Math.PI } };
 }
 
-// Изгиб корпуса поровну в 3 позвонках вокруг одной оси, таз на месте, угол не больше spine_max_deg.
+// Изгиб корпуса в 3 позвонках (доли spine_split) вокруг одной оси, таз на месте, угол не больше spine_max_deg.
 export function spineBend(J, target, conf) {
   const P = J.j0, C = J.chest, v0 = sub(C, P), v1 = sub(target, P);
   let axis = cross(v0, v1);
@@ -147,9 +147,10 @@ export function spineBend(J, target, conf) {
   let want = Math.atan2(s, dot(v0, v1));
   const limited = want > limit;
   want = Math.min(want, limit);
+  const parts = conf.spine_split ?? [1, 1, 1], sum = parts.reduce((x, y) => x + y, 0), split = parts.map(x => x / sum);
   const chain = theta => {
-    const R = rotAxis(axis, theta / 3);
-    const t1 = about(R, J.j0), t2 = compose(t1, about(R, J.j1)), t3 = compose(t2, about(R, J.j2));
+    const t1 = about(rotAxis(axis, theta * split[0]), J.j0), t2 = compose(t1, about(rotAxis(axis, theta * split[1]), J.j1));
+    const t3 = compose(t2, about(rotAxis(axis, theta * split[2]), J.j2));
     return { spine1: t1, spine2: t2, chest: t3 };
   };
   const achieved = T => { const v = sub(applyT(T.chest, C), P); return Math.atan2(dot(cross(v0, v), axis), dot(v0, v)); };

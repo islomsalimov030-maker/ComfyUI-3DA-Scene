@@ -256,11 +256,13 @@ def spine_bend(J, target, conf):
     limited = want > limit
     want = min(want, limit)
 
+    split = np.asarray(conf.get("spine_split", (1., 1., 1.)), dtype=float)
+    split = split / split.sum()
+
     def chain(theta):
-        R = rot_axis(axis, theta / 3)
-        t1 = about(R, J["j0"])
-        t2 = compose(t1, about(R, J["j1"]))
-        t3 = compose(t2, about(R, J["j2"]))
+        t1 = about(rot_axis(axis, theta * split[0]), J["j0"])
+        t2 = compose(t1, about(rot_axis(axis, theta * split[1]), J["j1"]))
+        t3 = compose(t2, about(rot_axis(axis, theta * split[2]), J["j2"]))
         return dict(spine1=t1, spine2=t2, chest=t3)
 
     def achieved(T):

@@ -164,7 +164,7 @@ def test_chest_bend_distributed_pelvis_fixed():
     K = skeleton()
     J = ik.joints(K)
     target = J['chest'] + [0, -.15, 0]                  # грудь на 15 см вперёд
-    T, info = ik.spine_bend(J, target, CONF)
+    T, info = ik.spine_bend(J, target, dict(CONF, spine_split=[1, 1, 1]))
     assert np.allclose(ik.apply(T['spine1'], J['j0']), J['j0'])               # таз на месте
     p = [J['j0']] + [ik.apply(T[b], J[n]) for b, n in (('spine1', 'j1'), ('spine2', 'j2'), ('chest', 'neck'))]
     old = [J['j0'], J['j1'], J['j2'], J['neck']]
@@ -179,6 +179,27 @@ def test_chest_bend_distributed_pelvis_fixed():
     v, w = chest - J['j0'], target - J['j0']
     assert math.degrees(math.acos(v @ w / np.linalg.norm(v) / np.linalg.norm(w))) < .05   # направление на цель
     assert chest[1] < J['chest'][1] - .1 and not info['limited']
+
+
+def test_chest_bend_hinge_default():
+    """E10c: по умолчанию (config/pose_edits.yaml) корпус выше таза едет жёстко, изгиб — шарнир в тазу: иначе у риска MPFB руки и
+    грудь проходят сквозь живот и бёдра (reports/e10c/integrity.json)."""
+    assert CONF['spine_split'] == [1, 0, 0]
+    K = skeleton()
+    J = ik.joints(K)
+    target = J['chest'] + [0, -.15, 0]
+    T, info = ik.spine_bend(J, target, CONF)
+    assert np.allclose(ik.apply(T['spine1'], J['j0']), J['j0'])               # таз на месте
+    assert np.allclose(T['spine1'][0], T['spine2'][0]) and np.allclose(T['spine2'][0], T['chest'][0])   # выше таза — один поворот
+    assert np.allclose(ik.apply(T['chest'], J['neck']) - ik.apply(T['chest'], J['j0']), T['chest'][0] @ (J['neck'] - J['j0']))
+    chest = ik.apply(T['chest'], J['chest'])
+    v, w = chest - J['j0'], target - J['j0']
+    assert math.degrees(math.acos(v @ w / np.linalg.norm(v) / np.linalg.norm(w))) < .05   # направление на цель
+    assert info['bend_deg'] > 1. and not info['limited']
+    old = dict(CONF)
+    old.pop('spine_split')                                                     # старый файл настроек: прежнее «поровну»
+    T2, _ = ik.spine_bend(J, target, old)
+    assert not np.allclose(T2['spine2'][0], T2['spine1'][0])
 
 
 def test_chest_bend_limited():
