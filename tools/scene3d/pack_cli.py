@@ -509,7 +509,8 @@ def prompt_direct(profile, config, fit):
     return text
 
 
-def prepare_images(directory, plate_path, proxy_mode, body_json, strength, cell_px, size=(1344, 768), margin=1.):
+def prepare_images(directory, plate_path, proxy_mode, body_json, strength, cell_px, size=(1344, 768), margin=1.,
+                   allow_empty_body=False):
     import numpy as np
     from PIL import Image
     import pose_proxy_v26 as proxy
@@ -524,10 +525,12 @@ def prepare_images(directory, plate_path, proxy_mode, body_json, strength, cell_
         sil = np.asarray(image.convert("L").resize(size, Image.Resampling.NEAREST)) >= 128
     Image.fromarray(sil.astype(np.uint8) * 255).save(directory / "silhouette.png")
     Image.fromarray(plate).save(directory / "plate.png")
-    if not sil.any():
+    # E17: манекен целиком за кадром — не ошибка, если в сцене есть предмет (его рисует H3 и без тела);
+    # без предметов пустой силуэт, как раньше, уводит 3DA на обычное фото.
+    if not sil.any() and not allow_empty_body:
         raise ValueError("renderer produced empty silhouette")
     figure = playblast
-    if proxy_mode == "color":
+    if proxy_mode == "color" and sil.any():
         colors = proxy.outfit_colors(required_file(body_json, "body_json for color proxy"))
         with Image.open(directory / "labels.png") as image:
             labels = proxy.decode_labels(np.asarray(image.convert("RGB").resize(size, Image.Resampling.NEAREST)), sil)
@@ -541,7 +544,7 @@ def prepare_images(directory, plate_path, proxy_mode, body_json, strength, cell_
     # 0.3.7: запас вокруг тела (волосы, тени H3) — клетка × margin; margin растёт с растром, чтобы в 2 Мп
     # полоса не становилась относительно тоньше, чем в 1 Мп. margin=1 — прежние 1+2 клетки.
     band = max(int(cell_px), int(round(cell_px * float(margin))))
-    sm = proxy.strength_map(sil, strength, band) if strength else np.zeros(sil.shape)
+    sm = proxy.strength_map(sil, strength, band) if strength and sil.any() else np.zeros(sil.shape)
     Image.fromarray(np.rint(sm * 255).astype(np.uint8)).save(directory / "strength.png")
     overlay = plate.astype(float) * (1 - .45 * sm[..., None])
     overlay += np.array([255, 70, 30]) * (.45 * sm[..., None])
@@ -639,6 +642,9 @@ def compose_props(directory, overlay_dir, size=(1344, 768), band=16):
     body = np.asarray(Image.open(directory / "strength.png").convert("L"), dtype=float) / 255
     props = [(Image.open(p["silhouette"]).convert("L").resize(size, Image.Resampling.NEAREST),
               p["prop_strength"]) for p in desc["props"]]
+    if not body.any() and not any((np.asarray(mask) > 127).any() for mask, _ in props):
+        # E17: тела нет в кадре и предмета тоже — рисовать нечего, как раньше уводим 3DA на обычное фото.
+        raise ValueError("renderer produced empty silhouette (no body and no props in frame)")
     # 0.4.0: тот же запас (body_margin), что вокруг тела, — и вокруг предмета.
     strength = prop_render.combine_strength(body, props, dilation_px=int(band), gaussian_px=2 * int(band))
     strength = prop_halo(strength, body, [np.asarray(mask) > 127 for mask, _ in props], int(band))
@@ -874,7 +880,8 @@ def do_place(request, config):
         return float(default if value is None else value)
     margin = setting("strength_margin", 2.0) * size[0] / 1344
     timings["strength_margin"] = round(margin, 3)
-    prepare_images(directory, source_plate, mode, body_path, strength, config["cell_px"], size, margin)
+    prepare_images(directory, source_plate, mode, body_path, strength, config["cell_px"], size, margin,
+                   allow_empty_body=bool(props_value))
     if props_value:
         from shutil import copy2
         body_dir=directory/'body_guides'
