@@ -2,13 +2,16 @@
 // кости руки/ноги/корпуса подстраиваются (IK), меш деформируется по весам LBS в реальном времени.
 // Правки хранятся в node.properties['3DA Pose Edits'] (локальные оси тела) и уходят в body_transform
 // ключом pose_edits (мировые оси) — сервер повторяет ту же IK перед постановкой.
-import { HANDLES, HANDLE_LABELS, handlePoints, solve, buildWeights, deform, posedHandles } from './poseRig.js';
+// E10c: тело MPFB (108144 треугольника) двигается по настоящему ригу (mpfbRig.js: те же кости и веса, что у сервера);
+// остальные тела и сбой привязки — приблизительные геодезические веса (poseRig.buildWeights), как раньше.
+import { HANDLES, HANDLE_LABELS, handlePoints, solve, buildWeights, deform, posedHandles, kpBones, applyT } from './poseRig.js';
+import { MPFB_TRIANGLES, loadMpfbRig, bindMesh, editedPositions } from './mpfbRig.js';
 
 const KEY = '3DA Pose Edits';
 const RADIUS = 0.03;
 const COLOR = 0xffc400, ACTIVE = 0xff3d00, EDITED = 0x00e5ff;
 
-export function poseHandles(view, body, node, changed, report = () => {}) {
+export function poseHandles(view, body, node, changed, report = () => {}, { loadRig = loadMpfbRig } = {}) {
   const rig = body.pose_rig;
   const K = rig?.kp_local, conf = rig?.config;
   if (!Array.isArray(K) || K.length !== 70 || !conf) {
@@ -64,7 +67,7 @@ export function poseHandles(view, body, node, changed, report = () => {}) {
     spheres[h] = mesh;
   }
   let active = null, posed = rest, frame = 0, ready = false, disposed = false, visible = true;
-  let paintFrame = 0, prewarm = null, finishPreparation;
+  let paintFrame = 0, prewarm = null, finishPreparation, mpfb = null, mpfbNote = '';
   const preparation = new Promise(resolve => { finishPreparation = resolve; });
   const pendingEditsError = () => new Error('Ручки позы: сохранение недоступно — правки не применены в 3D-окне. Исправьте ошибку подготовки или загрузите сцену заново.');
   const idle = globalThis.requestIdleCallback ?? (f => setTimeout(f, 0));
@@ -92,34 +95,59 @@ export function poseHandles(view, body, node, changed, report = () => {}) {
     m.color?.setHex?.(c); m.emissive?.setHex?.(c); m.emissiveIntensity = 0.6;
   };
   // Рест-позиции и веса — один раз на геометрию (переживают пересоздание 3D-окна).
+  // skin: { mpfb: привязка к ригу MPFB } или { rig: геодезические веса }.
   function rigOf(mesh) {
     body.object.updateMatrixWorld(true);
     const g = mesh.geometry, u = g.userData;
     const toBody = body.object.matrixWorld.clone().invert().multiply(mesh.matrixWorld);
-    const key = JSON.stringify([K, conf]);
+    const key = JSON.stringify([K, conf, !!mpfb]);
     // inverse(body.world) * mesh.world has round-off noise after moving the body.
     // Compare relative transforms with tolerance, not their JSON representation.
     const sameMatrix = u.threedaRigMatrix?.every((x, i) => Math.abs(x - toBody.elements[i]) <= 1e-9);
     if (!u.threedaRest) u.threedaRest = Float32Array.from(g.attributes.position.array);
-    if (!u.threedaRig || u.threedaRigKey !== key || !sameMatrix) {
+    if (!u.threedaSkin || u.threedaRigKey !== key || !sameMatrix) {
       const t0 = performance.now();
       const bodyRest = transformPositions(u.threedaRest, toBody, vec([0, 0, 0]));
-      u.threedaRig = buildWeights(bodyRest, g.index?.array ?? null, K, conf);
+      const index = g.index?.array ?? null;
+      let skin = null;
+      if (mpfb && index && index.length / 3 === MPFB_TRIANGLES) {
+        const bound = bindMesh(mpfb, bodyRest, index, K);
+        if (bound.ok) {
+          skin = { mpfb: bound };
+          console.info(`[3DA] риг MPFB: посадка на меш, медиана ${(bound.stats.median_m * 1e3).toFixed(2)} мм, ${Math.round(performance.now() - t0)} мс`);
+        } else mpfbNote = bound.reason;
+      }
+      if (!skin) {
+        skin = { rig: buildWeights(bodyRest, index, K, conf) };
+        console.info(`[3DA] веса позы: ${skin.rig.nU} вершин, диффузия ${skin.rig.iters}, ${Math.round(performance.now() - t0)} мс`);
+      }
+      u.threedaSkin = skin;
       u.threedaRigKey = key;
       u.threedaRigMatrix = [...toBody.elements];
-      console.info(`[3DA] веса позы: ${u.threedaRig.nU} вершин, диффузия ${u.threedaRig.iters}, ${Math.round(performance.now() - t0)} мс`);
     }
-    return { rig: u.threedaRig, toMesh: toBody.invert() };
+    return { skin: u.threedaSkin, toMesh: toBody.invert() };
+  }
+  // Точки MHR70 после правок: те же IK-повороты костей, что у сервера (pose_ik.apply_edits).
+  function editedKeypoints(T) {
+    const bones = kpBones(K);
+    return K.map((p, i) => applyT(T[bones[i]], p));
   }
   function apply() {
     const edits = Object.keys(offsets).length ? offsets : null;
     const { T } = solve(K, edits ?? {}, conf);
+    let kpEdited = null;
     for (const m of meshes) {
       const g = m.geometry, pos = g.attributes.position;
       if (edits) {
-        const { rig, toMesh } = rigOf(m);
-        deform(rig, T, pos.array);
-        transformPositions(pos.array, toMesh, vec([0, 0, 0]), pos.array);
+        const { skin, toMesh } = rigOf(m);
+        if (skin.mpfb) {
+          kpEdited ??= editedKeypoints(T);
+          skin.scratch = editedPositions(skin.mpfb, kpEdited, skin.scratch);
+          transformPositions(skin.scratch, toMesh, vec([0, 0, 0]), pos.array);
+        } else {
+          deform(skin.rig, T, pos.array);
+          transformPositions(pos.array, toMesh, vec([0, 0, 0]), pos.array);
+        }
       } else if (g.userData.threedaRest) pos.array.set(g.userData.threedaRest);
       else continue;
       pos.needsUpdate = true;
@@ -181,15 +209,20 @@ export function poseHandles(view, body, node, changed, report = () => {}) {
   paintFrame = requestAnimationFrame(() => {
     paintFrame = requestAnimationFrame(() => {
       paintFrame = 0;
-      prewarm = idle(() => {
+      prewarm = idle(async () => {
         prewarm = null;
         try {
+          // файл рига MPFB качаем только для тела с тем же числом треугольников
+          if (meshes.some(m => m.geometry.index?.array?.length / 3 === MPFB_TRIANGLES)) {
+            try { mpfb = await loadRig(); } catch (e) { mpfbNote = 'не загрузился файл рига: ' + (e?.message || String(e)); }
+            if (disposed) return;
+          }
           for (const m of meshes) rigOf(m);
           if (disposed) return;
           if (Object.keys(offsets).length) apply(); else sync();
           ready = true;
           for (const h of HANDLES) spheres[h].visible = visible;
-          report('ready', 'Ручки позы готовы');
+          report('ready', mpfbNote ? `Ручки позы готовы (приблизительные веса: ${mpfbNote})` : 'Ручки позы готовы');
           finishPreparation();
           view.forceRender?.();
         } catch (e) { if (!disposed) fail(e); }
