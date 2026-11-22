@@ -74,6 +74,8 @@ def args():
                     help="14.11: mpfb = Stacy's MPFB mannequin posed onto the placed MHR body; mhr = the MHR mesh itself")
     ap.add_argument("--contact-carry", default="",
                     help="E14: x,y,z (м) — контактный сдвиг манекена базовой постановки, перенесённый ручным сдвигом из 3D-окна")
+    ap.add_argument("--body-scale", type=float, default=None,
+                    help="E15: масштаб манекена (базовый × масштаб гизмо окна), без предела 0.85–1.15")
     ap.add_argument("--photo-emission", type=float, default=None,
                     help="override light.photo_emission (0 = the 05.11 playblast, 1.5 = photo-lit clay)")
     return ap.parse_args(argv)
@@ -649,7 +651,8 @@ def _run_body_obj(a, sc, info, cam, plate, light, out, scene, chars):
                                                               key=lambda o: len(o.data.vertices))
             verts = np.array([tuple(body.matrix_world @ v.co) for v in body.data.vertices])
             carry = tuple(float(x) for x in a.contact_carry.split(",")) if getattr(a, "contact_carry", "") else None
-            posed, model = pose_tools.pose_mannequin_to_mhr(rig, mpfb, kp, verts, plate, contact_carry=carry)
+            posed, model = pose_tools.pose_mannequin_to_mhr(rig, mpfb, kp, verts, plate, contact_carry=carry,
+                                                       scale_pin=getattr(a, "body_scale", None))
             body.name = "body_mhr"
             body.hide_render = body.hide_viewport = True
             posed.pass_index = 1

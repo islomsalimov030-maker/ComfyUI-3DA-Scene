@@ -17,11 +17,14 @@ NAME = 'body_contact.json'
 
 
 def save_base_contact(cache_dir, model):
-    """Контактный сдвиг манекена базовой (не сдвинутой) постановки из body_model.json рендера. -> записан ли."""
+    """Контактный сдвиг и масштаб манекена базовой (не сдвинутой) постановки из body_model.json рендера. -> записан ли."""
     dz = (model or {}).get('contact_dz_exact_m')
     if dz is None:
         return False
-    Path(cache_dir, NAME).write_text(json.dumps({'contact_dz_m': float(dz)}), encoding='utf-8')
+    data = {'contact_dz_m': float(dz)}
+    if model.get('scale') is not None:
+        data['scale'] = float(model['scale'])
+    Path(cache_dir, NAME).write_text(json.dumps(data), encoding='utf-8')
     return True
 
 
@@ -35,6 +38,35 @@ def carry_vector(cache_dir, transform, base_kp):
     probe = np.array([[0., 0., 0.], [0., 0., 1.]])
     moved = np.asarray(transform(probe, base_kp), float)
     return (moved[1] - moved[0]) * dz
+
+
+def carry_scale(cache_dir, transform, base_kp):
+    """E15: масштаб манекена после гизмо = базовый масштаб (у базовой постановки он уже мог упереться в предел 0,85–1,15)
+    × масштаб гизмо; окно масштабирует тот же базовый манекен. None — базовый масштаб не запомнен (старая постановка)."""
+    path = Path(cache_dir, NAME)
+    if not path.is_file():
+        return None
+    base = json.loads(path.read_text(encoding='utf-8')).get('scale')
+    if base is None:
+        return None
+    probe = np.array([[0., 0., 0.], [0., 0., 1.]])
+    moved = np.asarray(transform(probe, base_kp), float)
+    return float(base) * float(np.linalg.norm(moved[1] - moved[0]))
+
+
+def render_args(cache_dir, transform, base_kp):
+    """Ключи командной строки Blender-рендера для сдвинутого/правленого тела (--contact-carry, --body-scale) и их значения для timings.
+    Нет запомненной базовой посадки (постановка до E14) — пусто, рендер как раньше."""
+    vector = carry_vector(cache_dir, transform, base_kp)
+    if vector is None:
+        return [], {}
+    args = ['--contact-carry=' + ','.join(repr(float(x)) for x in vector)]      # «=»: вектор может начинаться с «-»
+    info = {'contact_carry_m': [round(float(x), 5) for x in vector]}
+    scale = carry_scale(cache_dir, transform, base_kp)
+    if scale is not None:
+        args.append('--body-scale=' + repr(scale))
+        info['body_scale'] = round(scale, 5)
+    return args, info
 
 
 def contact_translation(carry, compute):

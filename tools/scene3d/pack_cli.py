@@ -855,14 +855,14 @@ def do_place(request, config):
     timings["raster"] = list(size)
     # E14: ручной сдвиг/поворот из 3D-окна — манекен в рендере стоит на той же высоте, что в окне: контактная посадка
     # базовой постановки переносится вместе с телом, а не пересчитывается по сдвинутому MHR (давало ±1…4 см).
-    # Правки ручек позы (IK) и старые постановки без запомненной посадки — как раньше.
+    # E15: то же при правках ручек позы (окно не пересаживает манекен после правки ручек) и для масштаба гизмо
+    # (масштаб манекена = базовый × масштаб гизмо, а не предел 0,85–1.15 от сдвинутого MHR).
+    # Старые постановки без запомненной посадки — как раньше.
     carry = []
-    if moved and not pose_edits and body_model == "mpfb":
+    if moved and body_model == "mpfb":
         import manual_contact
-        vector = manual_contact.carry_vector(cache_dir, lambda X, KP: manual_pose.transform(X, KP, plate, values)[0], base["KP"])
-        if vector is not None:
-            carry = ["--contact-carry=" + ",".join(repr(float(x)) for x in vector)]   # «=»: вектор может начинаться с «-»
-            timings["contact_carry_m"] = [round(float(x), 5) for x in vector]
+        carry, info = manual_contact.render_args(cache_dir, lambda X, KP: manual_pose.transform(X, KP, plate, values)[0], base["KP"])
+        timings.update(info)
     run_stage(threeda_blender.command(config, HERE / "plate/render_plate_scene.py", ["--plate", plate_dir, "--spec", job / "render_spec.json",
                "--mannequin", mannequin, "--out", job / "render", "--label-pass", "--photo-emission", "2.5",
                "--samples", "48", "--raster", f"{size[0]}x{size[1]}",

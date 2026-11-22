@@ -619,6 +619,7 @@ def contact_shift(bvh, V, mesh, report, band=0.02, sample=4000):
     V = V[::max(1, len(V) // sample)]
     cm = np.array([np.nan if c is None else c for c in _height_above(bvh, [Vector(tuple(v)) for v in V])])
     if not np.isfinite(cm).any():
+        report.update(contact_dz_exact_m=0., contact_points=0)    # E15: «под телом нет комнаты» тоже запоминается (посадка = 0)
         return 0.
     low = np.nanquantile(cm, 0.02)
     touch = np.where(cm <= low + band)[0]
@@ -629,6 +630,7 @@ def contact_shift(bvh, V, mesh, report, band=0.02, sample=4000):
     near = sorted({tree.find(Vector(tuple(V[i])))[1] for i in touch})
     cp = np.array([np.nan if c is None else c for c in _height_above(bvh, [mesh.vertices[i].co for i in near])])
     if not np.isfinite(cp).any():
+        report.update(contact_dz_exact_m=0., contact_points=0)
         return 0.
     dz = float(np.nanmedian(cm[touch]) - np.nanmedian(cp))
     report.update(contact_dz_m=round(dz, 4), contact_dz_exact_m=dz, clearance_mhr_m=round(float(low), 4),
@@ -636,12 +638,14 @@ def contact_shift(bvh, V, mesh, report, band=0.02, sample=4000):
     return dz
 
 
-def pose_mannequin_to_mhr(rig, body, kp, mhr_verts=None, plate=None, subsurf=1, scale_limits=(0.85, 1.15), contact_carry=None):
+def pose_mannequin_to_mhr(rig, body, kp, mhr_verts=None, plate=None, subsurf=1, scale_limits=(0.85, 1.15), contact_carry=None,
+                          scale_pin=None):
     """Pose + place the MPFB mannequin on the MHR placement; return a static world mesh object (body_v2) and a report.
 
     kp: MHR70 joints (world, 70x3). mhr_verts: placed MHR vertices (world) for the contact height; plate: room mesh.
     contact_carry: E14, вектор контактного сдвига базовой постановки, перенесённый ручным сдвигом из 3D-окна —
-    берётся вместо пересчёта по сдвинутому MHR (None = пересчёт, как раньше)."""
+    берётся вместо пересчёта по сдвинутому MHR (None = пересчёт, как раньше).
+    scale_pin: E15, масштаб манекена = базовый × масштаб гизмо, без предела scale_limits (окно масштабирует тот же манекен)."""
     import numpy as np
     report = {"model": "mpfb", "removed": prepare_mannequin(rig, body)}
     hidden = [(o, o.hide_viewport) for o in (rig, body)]
@@ -666,7 +670,7 @@ def pose_mannequin_to_mhr(rig, body, kp, mhr_verts=None, plate=None, subsurf=1, 
             ((mw @ p["lowerleg01.R"].head) - (mw @ p["foot.R"].head)).length
     scale = chain(mh, ank_m) / max(chain(Jr, ank_r), 1e-6)
     report["scale_raw"] = round(scale, 4)
-    scale = min(max(scale, scale_limits[0]), scale_limits[1])
+    scale = float(scale_pin) if scale_pin is not None else min(max(scale, scale_limits[0]), scale_limits[1])
     rig.scale = rig.scale * scale
     bpy.context.view_layer.update()
     report["scale"] = round(scale, 4)
