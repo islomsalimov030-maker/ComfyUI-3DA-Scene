@@ -1,4 +1,4 @@
-"""E10c: one-off export of the MPFB mannequin rig for the 3D window (web/mpfbRig.bin.gz).
+"""E10c: export of the MPFB mannequin rig for the 3D window (web/mpfbRig.dat; E16: one file per character, web/mpfbRig_<id>.dat).
 
 The window used to deform the static GLB with geodesic weights, the server poses the real MPFB armature in Blender.
 This script dumps what the window needs to repeat the server: rest bone matrices (armature space), the bone hierarchy,
@@ -31,8 +31,10 @@ def load(mannequin):
     import bpy
     import pose_tools
     bpy.ops.wm.open_mainfile(filepath=str(mannequin))
-    rig = bpy.data.objects['stacy_rig']
-    body = bpy.data.objects['stacy_body']
+    # у манекена Стейси объекты stacy_rig / stacy_body; у других персонажей (E16) — любой арматурой и самым плотным мешем
+    rig = bpy.data.objects.get('stacy_rig') or next(o for o in bpy.data.objects if o.type == 'ARMATURE')
+    body = bpy.data.objects.get('stacy_body') or max((o for o in bpy.data.objects if o.type == 'MESH'),
+                                                     key=lambda o: len(o.data.vertices))
     removed = pose_tools.prepare_mannequin(rig, body)
     sub = body.modifiers.get('render_smooth') or body.modifiers.new('render_smooth', 'SUBSURF')
     sub.levels = sub.render_levels = SUBSURF

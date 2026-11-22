@@ -19,6 +19,7 @@ import test_pose_ik as base  # noqa: E402
 
 NODE = shutil.which('node')
 ASSET = ROOT / 'web/mpfbRig.dat'
+ASSET_SAMANTHA = ROOT / 'web/mpfbRig_samantha.dat'      # E16: риг манекена Саманты (та же топология и веса, свои кости/меш)
 
 
 def read_asset(path):
@@ -53,6 +54,22 @@ def test_asset_layout_and_weights():
     assert 1.4 < np.ptp(v[:, 2]) < 1.7
 
 
+def test_asset_samantha_layout():
+    header, d = read_asset(ASSET_SAMANTHA)
+    st, ds = read_asset(ASSET)
+    assert (header['n_vertices'], header['n_triangles'], header['bones'], header['top']) == (
+        st['n_vertices'], st['n_triangles'], st['bones'], st['top'])
+    # топология MPFB общая (окно узнаёт тело по числу треугольников); у нескольких квадов другая диагональ — триангуляция зависит от формы
+    diff = (d['tris'].reshape(-1, 3) != ds['tris'].reshape(-1, 3)).any(1)
+    assert diff.sum() < 200, diff.sum()
+    assert set(np.unique(d['tris'])) == set(np.unique(ds['tris']))
+    assert np.abs(d['wgt'].astype(float).reshape(-1, 8).sum(1) / 65535 - 1).max() < 2e-4
+    v = d['v_arm'].reshape(-1, 3)
+    height = np.ptp(v[:, 2]) * header['rig_world'][2][2]      # v_arm в осях рига, масштаб рига в rig_world
+    assert 2.27 < height < 2.33, f'манекен Саманты ростом 2,30 м (по мешу рига {height:.3f})'
+    assert not np.allclose(v, ds['v_arm'].reshape(-1, 3), atol=1e-3), 'у Саманты своя фигура'
+
+
 def test_writer_roundtrip(tmp_path):
     nV, nB, top = 5, 3, 2
     state = dict(names=['root', 'a', 'b'], parent=np.array([-1, 0, 1]), rest=np.tile(np.eye(4), (nB, 1, 1)),
@@ -76,9 +93,20 @@ def test_writer_roundtrip(tmp_path):
 @pytest.mark.skipif(NODE is None, reason='node не установлен')
 def test_rig_binding_and_pose_handles_cpu(tmp_path):
     """Настоящие mpfbRig.js/poseHandles.js на настоящем файле рига: привязка, правки, грудь, отказы, запасной путь."""
+    run_cpu_test(tmp_path)
+
+
+@pytest.mark.skipif(NODE is None, reason='node не установлен')
+def test_rig_binding_and_pose_handles_cpu_samantha(tmp_path):
+    """E16: тот же CPU-тест ручек E10/E10b на ригу и меше Саманты + проба «сначала Стейси, затем её файл»."""
+    run_cpu_test(tmp_path, 'mpfbRig_samantha.dat')
+
+
+def run_cpu_test(tmp_path, rig_file=None):
     K = base.skeleton()
     data = tmp_path / 'data.json'
     data.write_text(json.dumps(dict(K=K.tolist(), conf=base.CONF)), encoding='utf-8')
-    res = subprocess.run([NODE, str(ROOT / 'tests/mpfb_rig_cpu.mjs'), str(data)], capture_output=True, text=True, timeout=600)
+    res = subprocess.run([NODE, str(ROOT / 'tests/mpfb_rig_cpu.mjs'), str(data)] + ([rig_file] if rig_file else []),
+                         capture_output=True, text=True, timeout=600)
     assert res.returncode == 0, res.stdout + res.stderr
     assert 'mpfb_rig_cpu: ok' in res.stdout

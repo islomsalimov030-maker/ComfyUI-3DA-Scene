@@ -452,6 +452,9 @@ class PlacePose:
         if kwargs.get('body_json'):
             body = Path(kwargs['body_json'])
             paths.append(body if body.is_absolute() else Path(cfg['farm_root']) / body)
+        character = scene_settings(kwargs.get('settings'))['character']
+        if character != 'stacy':     # E16: тело и манекен выбранного персонажа (у Стейси ключ прежний)
+            paths += [root/'character_profile.py', *(Path(cfg['farm_root'])/'characters'/character).glob('*')]
         if isinstance(location,str) and Path(location).is_file():
             paths += list(Path(location).parent.glob('*'))
             loc_id=json.loads(Path(location).read_text(encoding='utf-8'))['loc_id']
@@ -514,6 +517,7 @@ class PlacePose:
             result = self.runner('place', dict(strength_margin=options['strength_margin'],
                             shadow_strength=options['shadow_strength'],
                             render_shadow_opacity=options['render_shadow_opacity'], body_model=options['body_model'],
+                            **({} if options['character'] == 'stacy' else {'character': options['character']}),
                             location=location, pose_class=pose_class, target_object=target_object,
                             support_parts=support_parts, secondary_contacts=secondary_contacts,
                             instance_hint=instance_hint, height_m=height_m, body_json=body_json,
@@ -581,10 +585,11 @@ class PlacePose:
             return fallback_outputs(short_reason(exc), error_text(exc))
 
 
+CHARACTERS = {'Стейси': 'stacy', 'Саманта': 'samantha'}   # E16: тело и манекен персонажа — characters/<id>/ в данных
 # 0.3.23: тело в рендере — манекен Стейси MPFB (пальцы, лицо) или меш MHR (SAM 3D Body); выбор в «3D-контроле».
 BODY_MODELS = {'Стейси MPFB (пальцы, лицо)': 'mpfb', 'MHR (SAM 3D Body)': 'mhr'}
 SETTINGS_DEFAULT = dict(render_shadows=False, strength_margin=2.0, shadow_strength=.7, render_shadow_opacity=.6,
-                        clean_shadows=False, body_model='mpfb')
+                        clean_shadows=False, body_model='mpfb', character='stacy')
 
 
 def scene_settings(value):
@@ -595,6 +600,8 @@ def scene_settings(value):
         out['clean_shadows'] = bool(value.get('clean_shadows', False))
         if value.get('body_model') in BODY_MODELS.values():
             out['body_model'] = value['body_model']
+        if value.get('character') in CHARACTERS.values():     # E16: персонаж из «3D-контроля» (по умолчанию Стейси)
+            out['character'] = value['character']
         for key, low, high in (('strength_margin', .25, 8.), ('shadow_strength', 0., 1.), ('render_shadow_opacity', 0., 1.)):
             try:
                 number = float(value.get(key, out[key]))
@@ -1583,7 +1590,6 @@ class BlenderRuntime:
         return {'ui': {'text': [text]}, 'result': (text,)}
 
 
-CHARACTERS = {'Стейси': 'stacy'}
 STEPS = ('Подготовка сцены', 'Генерация')
 SHADOWS = ('Тени от H3', 'Тени от рендера')
 
@@ -1597,7 +1603,8 @@ class Control:
         return {'required': {
             'control_3d': ('BOOLEAN', {'default': True, 'label_on': '3D-контроль ВКЛ', 'label_off': '3D-контроль ВЫКЛ',
                                        'tooltip': 'Вкл — поза, ракурс и предмет из 3D-сцены. Выкл — обычное фото: позу рисует MiniMax по промпту.'}),
-            'character': (list(CHARACTERS), {'default': 'Стейси', 'tooltip': 'Персонаж (пока только Стейси).'}),
+            'character': (list(CHARACTERS), {'default': 'Стейси', 'tooltip': 'Персонаж: его телосложение и манекен в 3D-окне и рендере '
+                                                                           '(Стейси — по умолчанию; Саманта — рост 2,30 м, мускулистое тело).'}),
             'step': (list(STEPS), {'default': STEPS[1], 'tooltip': 'Подготовка сцены — персонаж в комнате и 3D-окно; '
                                                                  'Генерация — финальное фото. Без 3D-контроля всегда Генерация.'}),
             'prop': (prop_choices(), {'default': NO_PROP, 'tooltip': 'Предмет в сцене или «(нет предмета)».'})},
@@ -1638,7 +1645,8 @@ class Control:
         chosen = prop if on and prop in prop_choices() else NO_PROP
         settings = scene_settings(dict(render_shadows=shadows == SHADOWS[1], strength_margin=body_margin,
                                        shadow_strength=shadow_strength, render_shadow_opacity=shadow_opacity,
-                                       clean_shadows=clean_shadows, body_model=BODY_MODELS.get(body, 'mpfb')))
+                                       clean_shadows=clean_shadows, body_model=BODY_MODELS.get(body, 'mpfb'),
+                                       character=CHARACTERS.get(character, 'stacy')))
         return (2 if on else 1, chosen, CHARACTERS.get(character, 'stacy'), settings)
 
 
