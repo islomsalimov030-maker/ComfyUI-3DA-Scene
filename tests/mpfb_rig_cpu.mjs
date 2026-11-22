@@ -1,6 +1,7 @@
 // E10c, CPU-тест web/mpfbRig.js и привязки риг MPFB в poseHandles.js: настоящий файл рига web/mpfbRig.dat,
 // синтетическая сцена (скелет из test_pose_ik, вершины рига в позе, как у GLB: углы продублированы, порядок вершин
-// перемешан, у нескольких квадов другая диагональ). node tests/mpfb_rig_cpu.mjs <data.json: {K (оси Z вверх), conf}>
+// перемешан, у нескольких квадов другая диагональ). node tests/mpfb_rig_cpu.mjs <data.json: {K (оси Z вверх), conf}> [файл рига в web/]
+// E16: второй аргумент — риг другого персонажа (mpfbRig_samantha.dat); тогда ещё проверяется, что окно с Стейси-первой пробой садится на её риг.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { parseRig, retarget, skinMatrices, skinVertices, bindMesh, editedPositions, MPFB_TRIANGLES } from '../web/mpfbRig.js';
@@ -8,7 +9,8 @@ import { solve, kpBones, applyT } from '../web/poseRig.js';
 import { poseHandles } from '../web/poseHandles.js';
 
 const { K: KZ, conf } = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-const rig = await parseRig(fs.readFileSync(new URL('../web/mpfbRig.dat', import.meta.url)));
+const RIG_FILE = process.argv[3] || 'mpfbRig.dat';
+const rig = await parseRig(fs.readFileSync(new URL('../web/' + RIG_FILE, import.meta.url)));
 const toY = p => [p[0], p[2], -p[1]], toZ = p => [p[0], -p[2], p[1]];
 const K = KZ.map(toY);                       // оси окна: Y вверх
 
@@ -204,5 +206,23 @@ async function setupHandles(loadRig, saved) {
   assert.match(states.at(-1).message, /приблизительные веса: не загрузился файл рига: HTTP 404/);
   assert.ok(mesh.geometry.userData.threedaSkin.rig);
   controller.dispose();
+}
+if (RIG_FILE !== 'mpfbRig.dat') {
+  // E16: меш персонажа не садится на риг Стейси (первая проба) — окно берёт его собственный файл; правки ручек те же, что с прямым ригом
+  const stacy = await parseRig(fs.readFileSync(new URL('../web/mpfbRig.dat', import.meta.url)));
+  const asked = [];
+  const { mesh, controller, states } = await setupHandles(async file => { asked.push(file); return file === 'mpfbRig.dat' ? stacy : rig; }, handEdit);
+  assert.deepEqual(asked, ['mpfbRig.dat', RIG_FILE], 'пробы: сначала Стейси, затем файл персонажа');
+  assert.equal(states.at(-1).state, 'ready'); assert.equal(states.at(-1).message, 'Ручки позы готовы');
+  assert.ok(mesh.geometry.userData.threedaSkin.mpfb, 'тело персонажа идёт по её ригу, а не по геодезическим весам');
+  const actual = mesh.geometry.attributes.position.array;
+  let d = 0;
+  for (let i = 0; i < actual.length; i++) d = Math.max(d, Math.abs(actual[i] - moved[i]));
+  assert.ok(d < 1e-5, `poseHandles (проба 2) ↔ editedPositions: ${d}`);
+  controller.dispose();
+  // меш Стейси на риге Стейси не трогает файл Саманты
+  const bAsk = [];
+  const stacyScene = bindMesh(stacy, scene.position, scene.index, K);
+  assert.equal(stacyScene.ok, false, 'меш Саманты не должен садиться на риг Стейси');
 }
 console.log('mpfb_rig_cpu: ok');

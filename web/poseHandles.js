@@ -5,7 +5,7 @@
 // E10c: тело MPFB (108144 треугольника) двигается по настоящему ригу (mpfbRig.js: те же кости и веса, что у сервера);
 // остальные тела и сбой привязки — приблизительные геодезические веса (poseRig.buildWeights), как раньше.
 import { HANDLES, HANDLE_LABELS, handlePoints, solve, buildWeights, deform, posedHandles, kpBones, applyT } from './poseRig.js';
-import { MPFB_TRIANGLES, loadMpfbRig, bindMesh, editedPositions } from './mpfbRig.js';
+import { MPFB_TRIANGLES, MPFB_RIG_FILES, loadMpfbRig, bindMesh, editedPositions } from './mpfbRig.js';
 
 const KEY = '3DA Pose Edits';
 const RADIUS = 0.03;
@@ -67,7 +67,7 @@ export function poseHandles(view, body, node, changed, report = () => {}, { load
     spheres[h] = mesh;
   }
   let active = null, posed = rest, frame = 0, ready = false, disposed = false, visible = true;
-  let paintFrame = 0, prewarm = null, finishPreparation, mpfb = null, mpfbNote = '';
+  let paintFrame = 0, prewarm = null, finishPreparation, mpfb = null, mpfbName = '', mpfbNote = '';
   const preparation = new Promise(resolve => { finishPreparation = resolve; });
   const pendingEditsError = () => new Error('Ручки позы: сохранение недоступно — правки не применены в 3D-окне. Исправьте ошибку подготовки или загрузите сцену заново.');
   const idle = globalThis.requestIdleCallback ?? (f => setTimeout(f, 0));
@@ -96,11 +96,12 @@ export function poseHandles(view, body, node, changed, report = () => {}, { load
   };
   // Рест-позиции и веса — один раз на геометрию (переживают пересоздание 3D-окна).
   // skin: { mpfb: привязка к ригу MPFB } или { rig: геодезические веса }.
-  function rigOf(mesh) {
+  // fallback = false: меш не сел на текущий риг — null без дорогих геодезических весов (нужно пробовать риг следующего персонажа).
+  function rigOf(mesh, fallback = true) {
     body.object.updateMatrixWorld(true);
     const g = mesh.geometry, u = g.userData;
     const toBody = body.object.matrixWorld.clone().invert().multiply(mesh.matrixWorld);
-    const key = JSON.stringify([K, conf, !!mpfb]);
+    const key = JSON.stringify([K, conf, mpfb ? mpfbName || true : false]);
     // inverse(body.world) * mesh.world has round-off noise after moving the body.
     // Compare relative transforms with tolerance, not their JSON representation.
     const sameMatrix = u.threedaRigMatrix?.every((x, i) => Math.abs(x - toBody.elements[i]) <= 1e-9);
@@ -114,10 +115,12 @@ export function poseHandles(view, body, node, changed, report = () => {}, { load
         const bound = bindMesh(mpfb, bodyRest, index, K);
         if (bound.ok) {
           skin = { mpfb: bound };
+          mpfbNote = '';      // меш мог не сесть на риг предыдущего персонажа — на этом сел
           console.info(`[3DA] риг MPFB: посадка на меш, медиана ${(bound.stats.median_m * 1e3).toFixed(2)} мм, ${Math.round(performance.now() - t0)} мс`);
         } else mpfbNote = bound.reason;
       }
       if (!skin) {
+        if (!fallback) return null;
         skin = { rig: buildWeights(bodyRest, index, K, conf) };
         console.info(`[3DA] веса позы: ${skin.rig.nU} вершин, диффузия ${skin.rig.iters}, ${Math.round(performance.now() - t0)} мс`);
       }
@@ -212,12 +215,22 @@ export function poseHandles(view, body, node, changed, report = () => {}, { load
       prewarm = idle(async () => {
         prewarm = null;
         try {
-          // файл рига MPFB качаем только для тела с тем же числом треугольников
-          if (meshes.some(m => m.geometry.index?.array?.length / 3 === MPFB_TRIANGLES)) {
-            try { mpfb = await loadRig(); } catch (e) { mpfbNote = 'не загрузился файл рига: ' + (e?.message || String(e)); }
-            if (disposed) return;
+          // файл рига MPFB качаем только для тела с тем же числом треугольников; у каждого персонажа свой риг
+          // (манекен подогнан под её фигуру): берём первый, на который сел меш окна
+          const isMpfb = meshes.some(m => m.geometry.index?.array?.length / 3 === MPFB_TRIANGLES);
+          const files = isMpfb ? MPFB_RIG_FILES : [null];
+          for (let i = 0; i < files.length; i++) {
+            if (files[i] !== null) {
+              try { mpfb = await loadRig(files[i]); mpfbName = files[i]; } catch (e) {
+                mpfb = null; mpfbNote = 'не загрузился файл рига: ' + (e?.message || String(e));
+                for (const m of meshes) rigOf(m);
+                break;
+              }
+              if (disposed) return;
+            }
+            const last = i === files.length - 1;
+            if (meshes.every(m => rigOf(m, last))) break;
           }
-          for (const m of meshes) rigOf(m);
           if (disposed) return;
           if (Object.keys(offsets).length) apply(); else sync();
           ready = true;

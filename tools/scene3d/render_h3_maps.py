@@ -77,8 +77,10 @@ def args():
 
 # ---------------------------------------------------------------- scene helpers (mirrors render_scene.py)
 def char_objects():
-    rig = bpy.data.objects["stacy_rig"]
-    body = bpy.data.objects["stacy_body"]
+    # E16: манекен другого персонажа (samantha_rig/samantha_body) — тот же порядок поиска, что у Стейси
+    rig = bpy.data.objects.get("stacy_rig") or next(o for o in bpy.data.objects if o.type == "ARMATURE")
+    body = bpy.data.objects.get("stacy_body") or max((o for o in bpy.data.objects if o.type == "MESH"),
+                                                     key=lambda o: len(o.data.vertices))
     return rig, body, [o for o in bpy.data.objects if o.parent == rig or o == rig]
 
 

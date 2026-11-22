@@ -305,13 +305,20 @@ export function skinVertices(rig, D, out = new Float64Array(rig.nV * 3)) {
 
 // ---------------------------------------------------------------------------------------------- загрузка
 export const MPFB_TRIANGLES = 108144;   // треугольников у тела MPFB (рендерный меш: маски + subsurf 1); быстрая проверка «это MPFB?»
-let cached = null;
-export function loadMpfbRig(url = new URL('./mpfbRig.dat', import.meta.url)) {
-  cached ??= fetch(url).then(r => {
-    if (!r.ok) throw new Error('mpfbRig.dat: HTTP ' + r.status);
-    return r.arrayBuffer();
-  }).then(parseRig).catch(e => { cached = null; throw e; });
-  return cached;
+// Риг на персонажа: топология и веса MPFB общие, а рест-кости и меш — по манекену (E16: Стейси, Саманта).
+// Порядок = порядок проб привязки в poseHandles; Стейси первая (прежнее поведение), остальные качаются только по отказу.
+export const MPFB_RIG_FILES = ['mpfbRig.dat', 'mpfbRig_samantha.dat'];
+const cached = new Map();
+export function loadMpfbRig(file = MPFB_RIG_FILES[0]) {
+  const url = file instanceof URL ? file : new URL('./' + file, import.meta.url);
+  const key = String(url);
+  if (!cached.has(key)) {
+    cached.set(key, fetch(url).then(r => {
+      if (!r.ok) throw new Error(String(file) + ': HTTP ' + r.status);
+      return r.arrayBuffer();
+    }).then(parseRig).catch(e => { cached.delete(key); throw e; }));
+  }
+  return cached.get(key);
 }
 
 // ---------------------------------------------------------------------------------------------- привязка меша GLB

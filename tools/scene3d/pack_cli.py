@@ -691,6 +691,12 @@ def do_place(request, config):
         raise ValueError("seed must be a nonnegative integer")
     mannequin = required_file(config["mannequin"], "config.mannequin / FARM_MANNEQUIN")
     body_path = request.get("body_json")
+    # E16: персонаж не Стейси — его тело, манекен и рост постановки из characters/<id>/ (Стейси: запрос как раньше)
+    import character_profile
+    character = character_profile.resolve(request, config)
+    if character:
+        mannequin, body_path, height = Path(character["mannequin"]), character["body_json"], character["height_m"]
+        timings["character"] = character["character"]
     body = read_json(required_file(body_path, "body_json")) if body_path else None
     if body is not None:
         if not isinstance(body.get("body_dims"), dict):
@@ -760,7 +766,10 @@ def do_place(request, config):
     plate = pf.Plate(plate_dir)
     stage = time.monotonic()
     import manual_pose
-    key = manual_pose.placement_key(rf, profile, config, spec, height, seed, {"body": body, "random_seed": seed_value})
+    key_extra = {"body": body, "random_seed": seed_value}
+    if character:   # манекен персонажа лежит в кэше постановки (body_mpfb.obj) — ключ меняется вместе с файлом
+        key_extra["mannequin_sha256"] = hashlib.sha256(mannequin.read_bytes()).hexdigest()[:16]
+    key = manual_pose.placement_key(rf, profile, config, spec, height, seed, key_extra)
     cache_dir = Path(config.get("cache_dir", str(Path(config["farm_root"]) / "cache"))) / "placement" / key
     base = manual_pose.load_placement(cache_dir, key)
     cache_hit = base is not None
