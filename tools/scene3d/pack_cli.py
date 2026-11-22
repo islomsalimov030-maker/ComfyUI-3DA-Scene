@@ -649,12 +649,13 @@ def compose_props(directory, overlay_dir, size=(1344, 768), band=16):
     strength = prop_render.combine_strength(body, props, dilation_px=int(band), gaussian_px=2 * int(band))
     strength = prop_halo(strength, body, [np.asarray(mask) > 127 for mask, _ in props], int(band))
     Image.fromarray(np.rint(strength * 255).astype("uint8")).save(directory / "strength.png")
-    from prop_composite import repair_mask
+    from prop_composite import repair_mask, support
     # Work from the actual quantized masks passed to Remote.
     quantized = np.rint(strength*255).astype('uint8')
     body_sil=np.asarray(Image.open(directory/'silhouette.png').convert('L'))>127
     prop_sil=np.logical_or.reduce([np.asarray(mask)>127 for mask,_ in props])
-    repair = repair_mask(body,quantized,body_sil,prop_sil)
+    # E17: манекен за кадром — весь общий фон ближе к предмету (edt по пустой маске тела бессмыслен): опора = вся полоса предмета.
+    repair = repair_mask(body,quantized,body_sil,prop_sil) if body_sil.any() else support(quantized)
     source = shaded(Image.open(directory/'plate.png'))
     layer = Image.open(desc['textured_rgba']).convert('RGBA').resize(size,Image.Resampling.LANCZOS)
     Image.alpha_composite(source,layer).convert('RGB').save(directory/'prop_repair.png')

@@ -62,8 +62,7 @@ def repair_mask(body_strength, total_strength, body_silhouette=None, prop_silhou
         # Noise-map tails overlap even when the actual objects do not. Excluding
         # the whole body noise support would cut a horizontal seam through props
         # near the head. Assign shared background to the nearest real silhouette.
-        # E17: манекен за кадром (пустой силуэт) — весь общий фон ближе к предмету; edt по пустой маске тут бессмыслен.
-        nearest_prop=distance_transform_edt(~prop)<distance_transform_edt(~body) if body.any() else np.ones_like(prop)
+        nearest_prop=distance_transform_edt(~prop)<distance_transform_edt(~body)
         return support(total_strength)&nearest_prop
     return support(total_strength) & ~support(body_strength)
 

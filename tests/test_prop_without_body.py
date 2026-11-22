@@ -28,7 +28,6 @@ def load(name, path):
 pack_cli = load('threeda_pack_cli_e17', ROOT / 'tools/scene3d/pack_cli.py')
 N = load('threeda_nodes_e17', ROOT / 'nodes.py')
 N.config = lambda: {'repo': str(ROOT)}
-import prop_composite  # noqa: E402
 import pose_proxy_v26 as proxy  # noqa: E402
 
 W, H, CELL, BAND = 256, 160, 16, 16
@@ -144,13 +143,6 @@ def test_repair_mask_covers_prop_without_body(tmp_path):
     pack_cli.compose_props(d, prop_overlay(tmp_path), (W, H), BAND)
     repair = read(d / 'prop_repair_mask.png') > 0
     assert repair[PROP_BOX].all(), 'предмет целиком в маске восстановления'
-
-
-def test_repair_mask_empty_body_helper():
-    prop = mask_of(PROP_BOX) > 0
-    strength = proxy.strength_map(prop, 1.0, BAND)
-    out = prop_composite.repair_mask(np.zeros((H, W)), strength, np.zeros((H, W), bool), prop)
-    assert (out == (prop_composite.support(strength))).all(), 'вся опора предмета, ничего не отрезано'
 
 
 def test_nothing_in_frame_falls_back_as_before(tmp_path):
